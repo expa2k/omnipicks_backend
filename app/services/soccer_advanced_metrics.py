@@ -57,6 +57,82 @@ def _get_season_year(game_date_str: str, league_id: Optional[int] = None) -> int
     return min(season, MAX_SEASON)
 
 
+_espn_names_cache: Dict[str, list] = {}
+
+_TEAM_STOPWORDS = {"fc", "cf", "club", "de", "ac", "sc", "afc", "cd", "ud", "ca", "the"}
+
+
+def _norm_team_name(name: str) -> str:
+    """Normaliza un nombre de equipo: sin acentos, minúsculas y sin prefijos tipo FC/CF/Club."""
+    import re
+    import unicodedata
+    s = unicodedata.normalize("NFKD", name or "").encode("ascii", "ignore").decode().lower()
+    s = re.sub(r"[^a-z0-9 ]", " ", s)
+    return " ".join(t for t in s.split() if t not in _TEAM_STOPWORDS)
+
+
+def _match_espn_team(team_name: str, candidates: list) -> Optional[str]:
+    """
+    Busca en `candidates` [(id, [alias...]), ...] el equipo que corresponde a `team_name`.
+    Devuelve el id de ESPN o None si no hay coincidencia clara (mejor sin dato que dato de otro equipo).
+    """
+    from difflib import SequenceMatcher
+    target = _norm_team_name(team_name)
+    if not target:
+        return None
+    t_tokens = set(target.split())
+
+    scored = []
+    for espn_id, aliases in candidates:
+        best = 0.0
+        for alias in aliases:
+            a = _norm_team_name(alias)
+            if not a:
+                continue
+            if a == target:
+                best = 1.0
+                break
+            a_tokens = set(a.split())
+            if a_tokens <= t_tokens or t_tokens <= a_tokens:  # uno contiene al otro
+                best = max(best, 0.92)
+            best = max(best, SequenceMatcher(None, a, target).ratio())
+        scored.append((best, espn_id))
+
+    scored.sort(reverse=True)
+    if not scored or scored[0][0] < 0.85:
+        return None
+    if len(scored) > 1 and scored[1][0] >= scored[0][0] - 0.02:
+        return None  # empate entre dos equipos -> ambiguo
+    return scored[0][1]
+
+
+async def _resolve_espn_team_id(team_name: str, league_slug: str) -> Optional[str]:
+    """
+    Los IDs de API-Sports NO son los mismos que los de ESPN, así que se resuelve el ID
+    de ESPN por nombre usando la lista de equipos de esa liga (1 llamada por liga, cacheada).
+    """
+    if league_slug not in _espn_names_cache:
+        url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league_slug}/teams"
+        candidates = []
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(url, params={"limit": 100}, timeout=8.0)
+                r.raise_for_status()
+                data = r.json()
+            for sport in data.get("sports", []):
+                for league in sport.get("leagues", []):
+                    for item in league.get("teams", []):
+                        t = item.get("team", {})
+                        aliases = [t.get(k) for k in ("displayName", "shortDisplayName", "name", "location") if t.get(k)]
+                        if t.get("id") and aliases:
+                            candidates.append((str(t["id"]), aliases))
+        except Exception as e:
+            logger.warning(f"ESPN teams list failed [{league_slug}]: {e}")
+        _espn_names_cache[league_slug] = candidates
+
+    return _match_espn_team(team_name, _espn_names_cache[league_slug])
+
+
 async def _fetch_espn_team_record(team_id: int, league_slug: str) -> Dict:
     """
     Obtiene el record actual del equipo desde ESPN (temporada actual, sin restricciones).
@@ -105,7 +181,7 @@ def _cache_key(team_id: int, league_id: int, season: int) -> str:
 async def _fetch_team_stats(team_id: int, league_id: int, season: int) -> Dict:
     """Fetches team statistics from API-Football v3."""
     import asyncio
-    
+
     key = _cache_key(team_id, league_id, season)
     if key in _stats_cache:
         return _stats_cache[key]
@@ -195,7 +271,7 @@ def _extract_stats_from_response(stats_data: Dict, prefix: str) -> Dict[str, flo
     clean_sheets = stats_data.get("clean_sheet", {}).get("total")
     failed_to_score = stats_data.get("failed_to_score", {}).get("total")
     fixtures_played = stats_data.get("fixtures", {}).get("played", {}).get("total", 1)
-    
+
     if clean_sheets is not None and fixtures_played:
         features[f"{prefix}_clean_sheet_pct"] = round(clean_sheets / max(fixtures_played, 1) * 100, 1)
     if failed_to_score is not None and fixtures_played:
@@ -387,35 +463,30 @@ async def extract_advanced_soccer_features(game_data: dict, game_date_str: str) 
     # ═══════════════════════════════════════════════════════════════════════
     # FUENTE 1: ESPN — record actual (siempre disponible, temporada actual)
     # ═══════════════════════════════════════════════════════════════════════
-    if home_id and away_id:
-        try:
-            home_record = await _fetch_espn_team_record(home_id, league_slug)
-            away_record = await _fetch_espn_team_record(away_id, league_slug)
-
-            if home_record.get("espn_gamesPlayed", 0) > 0:
-                gpm = home_record["espn_goals_per_game"]
-                gap = home_record["espn_goals_against_pg"]
-                features["home_goals_per_game"]         = gpm
-                features["home_goals_against_per_game"] = gap
-                features["home_xg_for"]                 = round(gpm, 2)
-                features["home_xga_against"]            = round(gap, 2)
-                features["home_win_pct"]                = home_record["espn_win_pct"]
-                gp = int(home_record["espn_gamesPlayed"])
-                logger.info(f"✅ ESPN {home_name}: {gp}G {home_record['espn_wins']:.0f}W {gpm:.1f}GPG")
-
-            if away_record.get("espn_gamesPlayed", 0) > 0:
-                gpm = away_record["espn_goals_per_game"]
-                gap = away_record["espn_goals_against_pg"]
-                features["away_goals_per_game"]         = gpm
-                features["away_goals_against_per_game"] = gap
-                features["away_xg_for"]                 = round(gpm, 2)
-                features["away_xga_against"]            = round(gap, 2)
-                features["away_win_pct"]                = away_record["espn_win_pct"]
-                gp = int(away_record["espn_gamesPlayed"])
-                logger.info(f"✅ ESPN {away_name}: {gp}G {away_record['espn_wins']:.0f}W {gpm:.1f}GPG")
-
-        except Exception as e:
-            logger.warning(f"ESPN soccer record fetch failed: {e}")
+    espn_keys = set()  # claves llenadas con datos REALES de ESPN (temporada actual)
+    try:
+        for prefix, name in (("home", home_name), ("away", away_name)):
+            espn_id = await _resolve_espn_team_id(name, league_slug)
+            if not espn_id:
+                logger.info(f"ESPN: sin equivalente claro para {name} [{league_slug}], se usará API-Football")
+                continue
+            rec = await _fetch_espn_team_record(espn_id, league_slug)
+            if rec.get("espn_gamesPlayed", 0) > 0:
+                gpm = rec["espn_goals_per_game"]
+                gap = rec["espn_goals_against_pg"]
+                values = {
+                    f"{prefix}_goals_per_game":         gpm,
+                    f"{prefix}_goals_against_per_game": gap,
+                    f"{prefix}_xg_for":                 round(gpm, 2),
+                    f"{prefix}_xga_against":            round(gap, 2),
+                    f"{prefix}_win_pct":                rec["espn_win_pct"],
+                }
+                features.update(values)
+                espn_keys.update(values)
+                gp = int(rec["espn_gamesPlayed"])
+                logger.info(f"✅ ESPN {name}: {gp}G {rec['espn_wins']:.0f}W {gpm:.1f}GPG")
+    except Exception as e:
+        logger.warning(f"ESPN soccer record fetch failed: {e}")
 
     # ═══════════════════════════════════════════════════════════════════════
     # FUENTE 2: API-Football — stats históricas (season 2024, profundidad)
@@ -431,15 +502,15 @@ async def extract_advanced_soccer_features(game_data: dict, game_date_str: str) 
             if home_stats:
                 home_hist = _extract_stats_from_response(home_stats, "home")
                 for key, val in home_hist.items():
-                    # Sobreescribir si es un feature exclusivo histórico, o si sigue teniendo el default de 1.2
-                    if (key not in features) or (features.get(key) == 1.2) or (key in ("home_form_points", "home_form_string", "home_clean_sheet_pct", "home_failed_to_score_pct", "home_yellow_per_game", "home_formation")):
+                    # API-Football llena todo, salvo lo que ESPN ya trajo con datos reales
+                    if key not in espn_keys:
                         features[key] = val
                 logger.info(f"✅ API-Football histórico {home_name}: {len(home_hist)} features")
 
             if away_stats:
                 away_hist = _extract_stats_from_response(away_stats, "away")
                 for key, val in away_hist.items():
-                    if (key not in features) or (features.get(key) == 1.2) or (key in ("away_form_points", "away_form_string", "away_clean_sheet_pct", "away_failed_to_score_pct", "away_yellow_per_game", "away_formation")):
+                    if key not in espn_keys:
                         features[key] = val
                 logger.info(f"✅ API-Football histórico {away_name}: {len(away_hist)} features")
 
