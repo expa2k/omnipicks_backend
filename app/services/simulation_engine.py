@@ -115,54 +115,92 @@ class SimulationEngine:
             }
         }
 
+    # Parámetros del modelo NBA
+    NBA_HOME_COURT = 2.5     # puntos de ventaja de local (margen)
+    NBA_SHRINK_GAMES = 10    # "partidos virtuales" de promedio de liga para suavizar inicio de temporada
+    NBA_B2B_PENALTY = 1.0    # puntos que pierde un equipo en back-to-back (y +0.5 al rival)
+    NBA_MARGIN_SD = 12.5     # desviación típica histórica del margen final
+    NBA_TOTAL_SD = 17.0      # desviación típica histórica del total de puntos
+
     def _simulate_nba(self, features: Dict[str, float]) -> Dict[str, Any]:
-        pace = features.get("expected_pace", 100.0)
-        home_elo = features.get("adjusted_home_elo", 1500.0)
-        away_elo = features.get("adjusted_away_elo", 1500.0)
-        
-        elo_diff = home_elo - away_elo + 50.0 # +50 localía
-        
-        # Convertir ELO diff a Spread (regla general NBA: 25 puntos ELO = 1 punto de spread)
-        spread = - (elo_diff / 25.0)
-        
-        # Puntos base por el ritmo
-        base_points = (pace * 1.1)
-        exp_home_pts = base_points - (spread / 2)
-        exp_away_pts = base_points + (spread / 2)
+        if features.get("api_error") or "home_off_rating" not in features:
+            result = self._fallback_simulation()
+            result["simulation_details"] = {"error": features.get("api_error", "Sin estadísticas de NBA")}
+            return result
+
+        league_off = features.get("league_off_rating", 114.0)
+        league_pace = features.get("league_pace", 99.0)
+        k = self.NBA_SHRINK_GAMES
+
+        def prior(prefix: str, key: str, mean: float) -> float:
+            # Prior = temporada pasada regresada 1/3 hacia la media (cambios de plantilla);
+            # si no hay temporada pasada, el promedio de liga.
+            prev = features.get(f"{prefix}_prev_{key}")
+            return mean if prev is None else (2 * prev + mean) / 3
+
+        def shrink(prefix: str, key: str, gp: int, mean: float) -> float:
+            # Con pocos partidos pesa más el prior; con muchos, la temporada actual
+            value = features[f"{prefix}_{key}"]
+            return (value * gp + prior(prefix, key, mean) * k) / (gp + k)
+
+        h_gp, a_gp = int(features.get("home_gp", 0)), int(features.get("away_gp", 0))
+        h_off = shrink("home", "off_rating", h_gp, league_off)
+        h_def = shrink("home", "def_rating", h_gp, league_off)
+        a_off = shrink("away", "off_rating", a_gp, league_off)
+        a_def = shrink("away", "def_rating", a_gp, league_off)
+        h_pace = shrink("home", "pace", h_gp, league_pace)
+        a_pace = shrink("away", "pace", a_gp, league_pace)
+
+        # Posesiones esperadas y eficiencia cruzada (ataque propio vs defensa rival)
+        possessions = h_pace * a_pace / league_pace
+        exp_home_pts = possessions * (h_off * a_def / league_off) / 100.0
+        exp_away_pts = possessions * (a_off * h_def / league_off) / 100.0
+
+        exp_home_pts += self.NBA_HOME_COURT / 2
+        exp_away_pts -= self.NBA_HOME_COURT / 2
+
+        if features.get("home_b2b"):
+            exp_home_pts -= self.NBA_B2B_PENALTY
+            exp_away_pts += self.NBA_B2B_PENALTY / 2
+        if features.get("away_b2b"):
+            exp_away_pts -= self.NBA_B2B_PENALTY
+            exp_home_pts += self.NBA_B2B_PENALTY / 2
+
+        exp_margin = exp_home_pts - exp_away_pts
+        exp_total = exp_home_pts + exp_away_pts
 
         home_wins = 0
-        away_wins = 0
-        total_pts_sim = []
-
+        totals = []
         for _ in range(self.num_simulations):
-            # Usar distribución normal para basket
-            home_sim = random.gauss(exp_home_pts, 10.0)
-            away_sim = random.gauss(exp_away_pts, 10.0)
-            
-            if home_sim > away_sim:
+            margin = random.gauss(exp_margin, self.NBA_MARGIN_SD)
+            while abs(margin) < 0.5:          # no hay empates: el tiempo extra decide
+                margin = random.gauss(exp_margin, self.NBA_MARGIN_SD)
+            if margin > 0:
                 home_wins += 1
-            elif away_sim > home_sim:
-                away_wins += 1
-            else:
-                home_wins += 1 # OT coinflip
-                
-            total_pts_sim.append(home_sim + away_sim)
+            totals.append(random.gauss(exp_total, self.NBA_TOTAL_SD))
 
-        avg_total = sum(total_pts_sim) / self.num_simulations
+        n = self.num_simulations
+        min_gp = min(h_gp, a_gp)
+        confidence = round(0.55 + 0.30 * min(1.0, min_gp / 30.0), 2)
 
         return {
-            "home_win_prob": home_wins / self.num_simulations,
-            "away_win_prob": away_wins / self.num_simulations,
+            "home_win_prob": home_wins / n,
+            "away_win_prob": 1 - home_wins / n,
             "draw_prob": 0.0,
-            "predicted_home_score": exp_home_pts,
-            "predicted_away_score": exp_away_pts,
-            "predicted_total": avg_total,
-            "predicted_spread": spread,
-            "confidence": 0.80,
+            "predicted_home_score": round(exp_home_pts, 1),
+            "predicted_away_score": round(exp_away_pts, 1),
+            "predicted_total": round(sum(totals) / n, 1),
+            "predicted_spread": round(-exp_margin, 1),   # negativo = local favorito
+            "confidence": confidence,
             "simulation_details": {
-                "num_simulations": self.num_simulations,
-                "pace_factor": round(pace, 1),
-                "elo_diff": round(elo_diff, 1)
+                "source": "Monte Carlo NBA: posesiones × eficiencia (nba_api)",
+                "num_simulations": n,
+                "expected_possessions": round(possessions, 1),
+                "home_off_adj": round(h_off, 1), "home_def_adj": round(h_def, 1),
+                "away_off_adj": round(a_off, 1), "away_def_adj": round(a_def, 1),
+                "home_court_pts": self.NBA_HOME_COURT,
+                "home_b2b": bool(features.get("home_b2b")),
+                "away_b2b": bool(features.get("away_b2b")),
             }
         }
 
