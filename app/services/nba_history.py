@@ -123,6 +123,43 @@ def fetch_player_bio(season: str) -> List[Dict]:
             for r in df.itertuples()]
 
 
+def fetch_players_index() -> List[Dict]:
+    """Posición, estatura y peso de todos los jugadores de la historia (1 llamada)."""
+    from nba_api.stats.endpoints import playerindex
+
+    df = call_nba(playerindex.PlayerIndex, league_id="00", season=season_of(date.today()), historical_nullable="1")[0]
+
+    def inches(h):
+        try:
+            ft, inch = str(h).split("-")
+            return float(ft) * 12 + float(inch)
+        except (ValueError, AttributeError):
+            return None
+
+    def num(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    return [{"player_id": int(r.PERSON_ID), "player_name": f"{r.PLAYER_FIRST_NAME} {r.PLAYER_LAST_NAME}".strip(),
+             "position": (r.POSITION or None), "height_in": inches(r.HEIGHT), "weight_lb": num(r.WEIGHT)}
+            for r in df.itertuples()]
+
+
+def load_players_index(engine) -> int:
+    from sqlalchemy.dialects.mysql import insert as mysql_insert
+    from app.db_models import NBAPlayer
+
+    rows = fetch_players_index()
+    with engine.begin() as conn:
+        for part in _chunks(rows):
+            stmt = mysql_insert(NBAPlayer).values(part)
+            conn.execute(stmt.on_duplicate_key_update(
+                position=stmt.inserted.position, height_in=stmt.inserted.height_in, weight_lb=stmt.inserted.weight_lb))
+    return len(rows)
+
+
 # ══════════════════════════════════════════════════════════════════════
 # Stints (por partido)
 # ══════════════════════════════════════════════════════════════════════
@@ -380,3 +417,63 @@ def load_stints(engine, seasons: List[str], workers: int = 3) -> Tuple[int, int]
                 eta = (total - n) / max(rate, 0.01) / 60
                 logger.info(f"Stints {n}/{total} (ok {done}, fallidos {failed}, incompletos {suspect}) · faltan ~{eta:.0f} min")
     return done, failed
+
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Quién reemplaza a quién (de las rotaciones)
+# ══════════════════════════════════════════════════════════════════════
+
+SUBS_CACHE = os.path.join(RAW_DIR, "..", "nba_subs.pkl")
+
+
+def substitution_pairs(raw: Dict) -> List[Tuple[int, int, int, float]]:
+    """[(equipo, sale, entra, peso)] de un partido, a partir de las rotaciones.
+
+    En cada momento en que un equipo cambia jugadores, cada uno de los que salen se
+    empareja con cada uno de los que entran (peso 1/k si salen k a la vez). No cuentan
+    el inicio del partido ni los que siguen en cancha.
+    """
+    starts: Dict[Tuple[int, int], set] = {}
+    ends: Dict[Tuple[int, int], set] = {}
+    for r in raw.get("rot", []):
+        if r["IN_TIME_REAL"] is None or r["OUT_TIME_REAL"] is None:
+            continue
+        team, pid = int(r["TEAM_ID"]), int(r["PERSON_ID"])
+        starts.setdefault((team, int(r["IN_TIME_REAL"])), set()).add(pid)
+        ends.setdefault((team, int(r["OUT_TIME_REAL"])), set()).add(pid)
+    out = []
+    for (team, t), outs in ends.items():
+        ins = starts.get((team, t), set())
+        outs, ins = outs - ins, ins - outs              # quien sale y vuelve a entrar en el mismo instante no cambia
+        if not outs or not ins or t == 0:
+            continue
+        w = 1.0 / max(len(outs), len(ins))
+        out.extend((team, o, i, w) for o in outs for i in ins)
+    return out
+
+
+def load_substitutions(game_ids) -> Dict[str, List[Tuple[int, int, int, float]]]:
+    """Pares de sustitución por partido, con caché en disco (solo se leen los crudos nuevos)."""
+    import pickle
+
+    cache: Dict[str, list] = {}
+    if os.path.exists(SUBS_CACHE):
+        try:
+            with open(SUBS_CACHE, "rb") as f:
+                cache = pickle.load(f)
+        except (OSError, ValueError, EOFError, pickle.UnpicklingError):
+            cache = {}
+    missing = [g for g in game_ids if g not in cache and os.path.exists(_raw_path(g))]
+    for g in missing:
+        try:
+            with gzip.open(_raw_path(g), "rt", encoding="utf-8") as f:
+                cache[g] = substitution_pairs(json.load(f))
+        except (OSError, ValueError):
+            continue
+    if missing:
+        tmp = f"{SUBS_CACHE}.tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump(cache, f)
+        os.replace(tmp, SUBS_CACHE)
+    return {g: cache[g] for g in game_ids if g in cache}

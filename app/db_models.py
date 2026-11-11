@@ -452,6 +452,17 @@ class NBAPlayerSeason(Base):
     weight_lb = Column(Float, nullable=True)
 
 
+class NBAPlayer(Base):
+    """Ficha fija de un jugador (posición oficial y medidas)."""
+    __tablename__ = "nba_players"
+
+    player_id = Column(Integer, primary_key=True)
+    player_name = Column(String(100), nullable=True)
+    position = Column(String(5), nullable=True)            # G, F, C, G-F, F-C, ...
+    height_in = Column(Float, nullable=True)
+    weight_lb = Column(Float, nullable=True)
+
+
 class NBAPlayerRating(Base):
     """Rating de un jugador en una fecha (se usa solo info anterior a esa fecha)."""
     __tablename__ = "nba_player_ratings"
@@ -464,6 +475,7 @@ class NBAPlayerRating(Base):
     d_rating = Column(Float, nullable=False)              # pts/100 pos sobre el promedio (defensa; + = bueno)
     uncertainty = Column(Float, nullable=True)
     minutes_sample = Column(Float, nullable=True)
+    usage_rate = Column(Float, nullable=True)             # (FGA + 0.44·FTA + TOV) por 100 posesiones en cancha
     model_version = Column(String(30), nullable=False, default="v1")
 
     __table_args__ = (

@@ -56,7 +56,10 @@ class RatingConfig:
     half_life_days: float = 400.0        # decaimiento de los stints (días efectivos)
     ridge_player: float = 4000.0         # penalización de δ, en posesiones
     ridge_box: float = 200.0             # penalización de γ
-    box_half_life_days: float = 150.0    # descuento del filtro de box score
+    box_half_life_days: float = 150.0    # descuento del filtro de box score (por calendario)
+    box_game_half_life: float = 0.0      # >0: el descuento va por partidos JUGADOS por el jugador (tipo Kalman):
+                                         # quien está lesionado conserva su nivel en vez de bajar a suplente
+    box_calendar_half_life: float = 600.0  # con descuento por partidos, el calendario descuenta solo esto
     box_prior_poss: float = 500.0        # peso del nivel de suplente, en posesiones
     mpg_prior_games: float = 5.0
     offseason_cap_days: float = 45.0     # el verano cuenta como máximo estos días
@@ -208,6 +211,7 @@ class DayRatings:
     seen: np.ndarray              # (P,) el jugador ya debutó
     home_edge: float              # ventaja de local en pts/100 (margen)
     league_eff: float             # eficiencia media de la liga, pts/100
+    usage: Optional[np.ndarray] = None   # (P,) uso: (FGA + 0.44·FTA + TOV) por 100 posesiones en cancha
 
 
 class RatingEngine:
@@ -267,7 +271,14 @@ class RatingEngine:
         var = cfg.sigma ** 2 * (1.0 / (diag[COL_PLAYERS:COL_PLAYERS + P] + cfg.ridge_player)
                                 + 1.0 / (diag[COL_PLAYERS + P:] + cfg.ridge_player))
         return DayRatings(day=day, o=o, d=d, unc=np.sqrt(var), mpg=self.mpg(), minutes=self.min_sum.copy(),
-                          seen=self.seen.copy(), home_edge=2.0 * th[COL_HOME], league_eff=th[COL_MEAN])
+                          seen=self.seen.copy(), home_edge=2.0 * th[COL_HOME], league_eff=th[COL_MEAN],
+                          usage=self.usage())
+
+    def usage(self) -> np.ndarray:
+        m = self.cfg.box_prior_poss
+        rates = 100.0 * (self.alpha + m * self.prep.prior_rate) / (self.beta + m)[:, None]
+        i = {k: BOX_STATS.index(k) for k in ("fga", "fta", "tov")}
+        return rates[:, i["fga"]] + 0.44 * rates[:, i["fta"]] + rates[:, i["tov"]]
 
     # ── Filas de la regresión para los tramos de un día ───────────────
     def _rows(self, i: int, z: np.ndarray):
@@ -345,7 +356,8 @@ class RatingEngine:
         g = 0.5 ** (days / cfg.half_life_days)
         self.A *= g
         self.b *= g
-        gb = 0.5 ** (days / cfg.box_half_life_days)
+        hl = cfg.box_calendar_half_life if cfg.box_game_half_life > 0 else cfg.box_half_life_days
+        gb = 0.5 ** (days / hl)
         self.alpha *= gb
         self.beta *= gb
         self.min_sum *= gb
@@ -355,6 +367,13 @@ class RatingEngine:
         prep = self.prep
         a, b = prep.box_slices[i], prep.box_slices[i + 1]
         p = prep.box_p[a:b]
+        if self.cfg.box_game_half_life > 0 and len(p):
+            u = np.unique(p)
+            gg = 0.5 ** (1.0 / self.cfg.box_game_half_life)
+            self.alpha[u] *= gg
+            self.beta[u] *= gg
+            self.min_sum[u] *= gg
+            self.min_games[u] *= gg
         np.add.at(self.alpha, p, prep.box_stats[a:b])
         np.add.at(self.beta, p, prep.box_poss[a:b])
         np.add.at(self.min_sum, p, prep.box_min[a:b])
@@ -385,6 +404,7 @@ def rating_rows(prep: Prepared, r: DayRatings, active_minutes: float = 1.0) -> L
         "as_of_date": r.day, "player_id": int(prep.player_ids[p]), "player_name": prep.player_names[p],
         "o_rating": round(float(r.o[p]), 3), "d_rating": round(float(r.d[p]), 3),
         "uncertainty": round(float(r.unc[p]), 3), "minutes_sample": round(float(r.minutes[p]), 1),
+        "usage_rate": None if r.usage is None else round(float(r.usage[p]), 2),
         "model_version": MODEL_VERSION,
     } for p in keep]
 

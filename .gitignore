@@ -33,3 +33,4 @@ ml/saved_models/*
 !ml/datasets/.gitkeep
 !ml/saved_models/.gitkeep
 !ml/saved_models/nba_v2.json
+!ml/saved_models/nba_minutes.txt

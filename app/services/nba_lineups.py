@@ -30,6 +30,8 @@ ROTATION_MIN = 15.0         # jugador "de rotación" (para detectar bajas en el 
 LEARN_GAMES = 60            # partidos del equipo para aprender el reparto de minutos
 LEARN_DAYS = 150
 LEARN_SHRINK = 15.0
+REPL_DECAY = 0.985          # por partido del equipo (~45 partidos de vida media)
+REPL_PRIOR = 2.0            # peso del parecido por posición y estatura, en sustituciones
 
 
 @dataclass
@@ -46,6 +48,17 @@ class RosterTracker:
     player_games: Dict[int, deque] = field(default_factory=dict)       # jugador → (fecha, equipo, minutos)
     team_games: Dict[int, deque] = field(default_factory=dict)         # equipo → (fecha, {jugadores})
     team_minutes: Dict[int, deque] = field(default_factory=dict)       # equipo → (fecha, {jugador: minutos})
+    replacements: Dict[int, Dict[int, Dict[int, float]]] = field(default_factory=dict)   # equipo → sale → entra → peso
+
+    def add_substitutions(self, team: int, pairs):
+        """Suma las sustituciones de un partido del equipo, descontando las viejas."""
+        rep = self.replacements.setdefault(team, {})
+        for row in rep.values():
+            for k in row:
+                row[k] *= REPL_DECAY
+        for out_p, in_p, w in pairs:
+            row = rep.setdefault(int(out_p), {})
+            row[int(in_p)] = row.get(int(in_p), 0.0) + w
 
     def update(self, day: date, team: int, players, minutes):
         played = set()
@@ -99,8 +112,35 @@ class RosterTracker:
 # 3a + 3b: minutos esperados
 # ══════════════════════════════════════════════════════════════════════
 
+@dataclass
+class ReplacementContext:
+    """A quién van los minutos de cada jugador: lo observado en el equipo y, de respaldo,
+    el parecido por posición y estatura."""
+    observed: Dict[int, Dict[int, float]]                  # sale → entra → peso (del tracker)
+    height: Dict[int, float] = field(default_factory=dict)
+    position: Dict[int, str] = field(default_factory=dict)
+    prior: float = REPL_PRIOR
+
+    def similarity(self, x: int, y: int) -> float:
+        hx, hy = self.height.get(x), self.height.get(y)
+        s = float(np.exp(-((hx - hy) / 3.0) ** 2)) if hx and hy else 0.5
+        px, py = self.position.get(x) or "", self.position.get(y) or ""
+        if px and py:
+            s *= 1.0 if set(px.split("-")) & set(py.split("-")) else 0.4
+        return s
+
+    def shares(self, x: int, ys: List[int]) -> np.ndarray:
+        """Fracción de los minutos de x que va a cada y disponible."""
+        row = self.observed.get(x, {})
+        obs = np.array([row.get(y, 0.0) for y in ys])
+        sim = np.array([self.similarity(x, y) for y in ys])
+        sim = sim / sim.sum() if sim.sum() > 0 else np.full(len(ys), 1.0 / max(len(ys), 1))
+        w = obs + self.prior * sim
+        return w / w.sum() if w.sum() > 0 else sim
+
 def expected_minutes(cands: List[Candidate], play_prob: Optional[Dict[int, float]] = None,
-                     returning: Optional[set] = None, shift: Optional[Dict[int, float]] = None) -> Tuple[np.ndarray, np.ndarray]:
+                     returning: Optional[set] = None, shift: Optional[Dict[int, float]] = None,
+                     ctx: Optional["ReplacementContext"] = None) -> Tuple[np.ndarray, np.ndarray]:
     """Minutos esperados de cada candidato para un partido. Devuelve (minutos, tope).
 
     play_prob: probabilidad de jugar de quienes están en el reporte (0 = fuera). Quien no
@@ -111,6 +151,7 @@ def expected_minutes(cands: List[Candidate], play_prob: Optional[Dict[int, float
     returning = returning or set()
     want = np.zeros(len(cands))
     cap = np.zeros(len(cands))
+    full = np.zeros(len(cands))
     for i, c in enumerate(cands):
         if c.player in returning:
             want[i] = RETURN_FACTOR * c.base * play_prob.get(c.player, 1.0)
@@ -122,10 +163,23 @@ def expected_minutes(cands: List[Candidate], play_prob: Optional[Dict[int, float
         else:
             want[i] = c.base * c.rate
         cap[i] = min(CAP_MAX, c.base + CAP_EXTRA)
+        # Minutos que tendría disponible del todo (para saber cuántos deja libres)
+        full[i] = c.base * (1.0 if c.base >= ROTATION_MIN else max(c.rate, 0.5)) if (c.player in play_prob or c.player in returning) else c.base * c.rate
         if shift and want[i] > 0 and c.player in shift:
             # Lo aprendido sobre a quién van los minutos; el tope sube con lo aprendido
             want[i] = max(0.0, want[i] + shift[c.player])
             cap[i] = min(CAP_MAX, max(cap[i], want[i]))
+    if ctx is not None:
+        # 3b por reemplazos: los minutos libres de cada ausente van a quienes suelen entrar por él
+        free = np.maximum(full - want, 0.0)
+        avail = np.flatnonzero(want > 0)
+        if len(avail) and free.sum() > 0:
+            ys = [cands[j].player for j in avail]
+            add = np.zeros(len(cands))
+            for i in np.flatnonzero(free > 0.5):
+                add[avail] += free[i] * ctx.shares(cands[i].player, ys)
+            want = want + add
+            cap = np.minimum(CAP_MAX, np.maximum(cap, want))
     return fill_minutes(want, cap), cap
 
 
@@ -159,7 +213,8 @@ def team_net(minutes: np.ndarray, total_rating: np.ndarray) -> float:
 # ══════════════════════════════════════════════════════════════════════
 
 def absence_impact(cands: List[Candidate], total_rating: np.ndarray, player: int, pace: float = 0.97,
-                   other_probs: Optional[Dict[int, float]] = None) -> Optional[Dict]:
+                   other_probs: Optional[Dict[int, float]] = None, ctx: Optional[ReplacementContext] = None,
+                   returning: Optional[set] = None) -> Optional[Dict]:
     """Cuánto cambia el margen esperado del equipo si `player` no juega.
 
     total_rating[i] es O + D del candidato i. Devuelve los puntos de margen (negativo =
@@ -170,8 +225,8 @@ def absence_impact(cands: List[Candidate], total_rating: np.ndarray, player: int
         return None
     others = dict(other_probs or {})
     others.pop(player, None)
-    with_min, _ = expected_minutes(cands, {**others, player: 1.0})
-    without_min, _ = expected_minutes(cands, {**others, player: 0.0})
+    with_min, _ = expected_minutes(cands, {**others, player: 1.0}, returning, ctx=ctx)
+    without_min, _ = expected_minutes(cands, {**others, player: 0.0}, returning, ctx=ctx)
     delta = without_min - with_min
     gains = sorted(((cands[i].player, float(delta[i])) for i in range(len(cands)) if i != idx and delta[i] > 0.5),
                    key=lambda x: -x[1])
@@ -210,10 +265,13 @@ def load_tracker(engine, today: date, days: int = ROSTER_MAX_DAYS) -> Tuple[Rost
             "SELECT game_id, game_date, team_id, player_id, player_name, minutes FROM nba_player_games "
             "WHERE game_date >= :a AND game_date < :b AND minutes > 0 ORDER BY game_date, game_id"),
             conn, params={"a": today - timedelta(days=days), "b": today})
+    from app.services.nba_history import load_substitutions
+    subs = load_substitutions(box["game_id"].drop_duplicates().tolist())
     tracker = RosterTracker()
     for (gid, tid), g in box.groupby(["game_id", "team_id"], sort=False):
         d = g["game_date"].iloc[0]
         tracker.update(d if isinstance(d, date) else d.date(), int(tid), g["player_id"].tolist(), g["minutes"].tolist())
+        tracker.add_substitutions(int(tid), [(o, n, w) for (t, o, n, w) in subs.get(gid, []) if t == int(tid)])
     names = dict(zip(box["player_id"].astype(int), box["player_name"]))
     return tracker, names
 
@@ -267,3 +325,63 @@ def injury_impacts(engine, today: date) -> List[Dict]:
                 "minutes_to": [(names.get(p, str(p)), round(m, 1)) for p, m in imp["minutes_to"]],
             })
     return sorted(out, key=lambda x: x["margin_without"])
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Modelo de minutos con LightGBM (lo entrena ml/scripts/nba_minutes_model.py)
+# ══════════════════════════════════════════════════════════════════════
+
+import os as _os
+
+MINUTES_MODEL_PATH = _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..", "..", "ml", "saved_models", "nba_minutes.txt"))
+MINUTES_FEATURES = [
+    "base", "rate", "games", "last_min", "mean5", "mean20", "days_since", "team_rest", "returning",
+    "m_prop", "m_rep", "rep_gain", "team_free", "base_rank", "n_cands", "rating", "rating_rank",
+]
+
+
+def minutes_features(tracker: RosterTracker, cands: List[Candidate], day: date, outs: Dict[int, float],
+                     returning: set, m_prop: np.ndarray, m_rep: np.ndarray, rating: np.ndarray,
+                     team_rest: float) -> np.ndarray:
+    """Variables por jugador para el modelo de minutos (mismo orden que MINUTES_FEATURES)."""
+    n = len(cands)
+    base = np.array([c.base for c in cands])
+    base_rank = (-base).argsort().argsort().astype(float)
+    rating_rank = (-np.asarray(rating, float)).argsort().argsort().astype(float)
+    team_free = float(sum(c.base for c in cands if c.player in outs))
+    rows = np.zeros((n, len(MINUTES_FEATURES)))
+    for i, c in enumerate(cands):
+        games = tracker.player_games.get(c.player, ())
+        mins = [m for (_, _, m) in games]
+        last_day = games[-1][0] if games else day
+        rows[i] = [
+            c.base, c.rate, c.games, mins[-1] if mins else 0.0,
+            float(np.mean(mins[-5:])) if mins else 0.0, float(np.mean(mins)) if mins else 0.0,
+            min((day - last_day).days, 60), min(team_rest, 7), float(c.player in returning),
+            m_prop[i], m_rep[i], m_rep[i] - m_prop[i], team_free, base_rank[i], n, rating[i], rating_rank[i],
+        ]
+    return rows
+
+
+class MinutesModel:
+    """Carga el LightGBM guardado y predice los minutos de un equipo (240 en total)."""
+
+    def __init__(self, path: str = MINUTES_MODEL_PATH):
+        import lightgbm as lgb
+        self.booster = lgb.Booster(model_file=path)
+
+    @classmethod
+    def load(cls) -> Optional["MinutesModel"]:
+        if not _os.path.exists(MINUTES_MODEL_PATH):
+            return None
+        try:
+            return cls()
+        except Exception:
+            return None
+
+    def predict(self, X: np.ndarray, out_mask: np.ndarray, play_prob: Optional[np.ndarray] = None) -> np.ndarray:
+        pred = np.clip(self.booster.predict(X), 0.0, 44.0)
+        if play_prob is not None:
+            pred = pred * play_prob
+        pred[out_mask] = 0.0
+        return fill_minutes(np.where(pred > 0.5, pred, 0.0), np.full(len(pred), 48.0))

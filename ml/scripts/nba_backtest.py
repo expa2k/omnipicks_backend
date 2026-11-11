@@ -34,12 +34,14 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import Ridge
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 
 from app.config import get_settings
 from app.services.nba_game_model import (MARGIN_FEATURES, TOTAL_FEATURES, ModelParams, PaceState, ScheduleState,
                                          game_possessions, normal_cdf, structural, team_strength)
-from app.services.nba_lineups import ROTATION_MIN, RosterTracker, expected_minutes
+from app.services.nba_history import load_substitutions
+from app.services.nba_lineups import (MINUTES_FEATURES, ROTATION_MIN, ReplacementContext, RosterTracker,
+                                      expected_minutes, minutes_features)
 from app.services.nba_ratings import Prepared, RatingConfig, RatingEngine, load_data
 from nba_ratings_eval import elo_predictions, team_logs
 
@@ -131,8 +133,11 @@ def collect(prep: Prepared, cfg: RatingConfig) -> pd.DataFrame:
         sched.season_start[season] = reg.game_date.min()
         sched.season_end[season] = reg.game_date.max()
     pace, v1, tracker = PaceState(), V1State(), RosterTracker()
+    subs = load_substitutions(games.game_id.tolist())
+    height, pos = _player_info(prep)
+    last_team_game = {}
     fed = [0]
-    rows = []
+    rows, side_store = [], {}
 
     def feed_until(i):
         while fed[0] < i:
@@ -142,6 +147,9 @@ def collect(prep: Prepared, cfg: RatingConfig) -> pd.DataFrame:
                 for tid in (h, a):
                     if (g.game_id, tid) in actual:
                         tracker.update(d, tid, *actual[(g.game_id, tid)])
+                    tracker.add_substitutions(tid, [(prep.pidx[o], prep.pidx[n], w) for (t, o, n, w) in subs.get(g.game_id, [])
+                                                    if t == tid and o in prep.pidx and n in prep.pidx])
+                    last_team_game[tid] = d
                 sched.add(d, h, a)
                 poss = game_possessions(box_by_game.get(g.game_id, pd.DataFrame()))
                 if poss:
@@ -161,7 +169,7 @@ def collect(prep: Prepared, cfg: RatingConfig) -> pd.DataFrame:
             ctx = sched.game(r.day, g.season, g.season_type, h, a)
             rec = {"game_id": g.game_id, "game_date": g.game_date, "season": g.season, "season_type": g.season_type,
                    "home": h, "away": a, "home_pts": g.home_pts, "away_pts": g.away_pts, **ctx,
-                   "outs": 0, "key_out": False, "miss_min": 0.0}
+                   "outs": 0, "key_out": False, "miss_min": 0.0, "usage_gap": 0.0}
             strengths = {s: {} for s in SETTINGS}
             ok = True
             for side, tid in (("h", h), ("a", a)):
@@ -176,31 +184,88 @@ def collect(prep: Prepared, cfg: RatingConfig) -> pd.DataFrame:
                 back = {c.player for c in cands if c.player in act and c.rate <= 0.2 and c.base >= ROTATION_MIN}
                 absent = {c.player: 0.0 for c in cands if c.player not in act}
                 present = {c.player: 1.0 for c in cands if c.player in act}
+                rctx = ReplacementContext(tracker.replacements.get(tid, {}), height, pos)
+                m_prop = expected_minutes(cands, outs, back)[0]
+                m_rep = expected_minutes(cands, outs, back, ctx=rctx)[0]
+                rest = (r.day - last_team_game[tid]).days if tid in last_team_game else 3
+                side_store[(g.game_id, side)] = {
+                    "season": g.season, "o": r.o[ids], "d": r.d[ids], "m_prop": m_prop,
+                    "X": minutes_features(tracker, cands, r.day, outs, back, m_prop, m_rep, (r.o + r.d)[ids], rest),
+                    "out": np.array([c.player in outs for c in cands]),
+                    "actual": np.array([act_min[list(act_p).index(p)] if p in act else 0.0 for p in ids.tolist()])}
                 proj = {"sin_info": expected_minutes(cands)[0],
-                        "con_bajas": expected_minutes(cands, outs, back)[0],
+                        "con_bajas": m_prop,
                         "sabe_quien": expected_minutes(cands, {**absent, **present})[0]}
                 for s, m in proj.items():
                     strengths[s][side] = team_strength(m, r.o[ids], r.d[ids])
                 sign = 1.0 if side == "h" else -1.0
                 rec["outs"] += len(outs)
                 rec["miss_min"] += sign * sum(c.base for c in cands if c.player in outs) / 10.0
+                # 3c/D: uso que deja libre cada ausente (uso × minutos / 48), por cada 10 puntos de uso
+                rec["usage_gap"] += sign * sum(r.usage[c.player] * c.base / 48.0 for c in cands if c.player in outs) / 10.0
                 rec["key_out"] |= any(c.base >= KEY_MPG for c in cands if c.player in outs)
             if not ok:
                 continue
+            rec["_pace"] = (pace.pace(h), pace.pace(a), pace.league_pace(), pace.league_ppp(), r.league_eff, r.home_edge)
             for s in SETTINGS:
-                hp, ap = structural(strengths[s]["h"], strengths[s]["a"], pace.pace(h), pace.pace(a),
-                                    pace.league_pace(), pace.league_ppp(), r.league_eff, r.home_edge)
+                hp, ap = structural(strengths[s]["h"], strengths[s]["a"], *rec["_pace"])
                 rec[f"{s}_hp"], rec[f"{s}_ap"] = hp, ap
             rec["v1_hp"], rec["v1_ap"] = v1.predict(h, a, ctx["b2b_h"], ctx["b2b_a"])
             rows.append(rec)
 
     RatingEngine(prep, cfg).run(first_output=WARMUP_OUTPUT, on_day=on_day)
-    df = pd.DataFrame(rows)
+    _lgbm_minutes(rows, side_store)
+    df = pd.DataFrame(rows).drop(columns=["_pace"])
     df["margin"] = df.home_pts - df.away_pts
     df["total"] = df.home_pts + df.away_pts
     elo = pd.Series(elo_predictions(games), index=games.game_id)
     df["elo_m"] = df.game_id.map(elo)
     return df
+
+
+def _player_info(prep: Prepared):
+    engine = create_engine(get_settings().mysql_url_sync)
+    with engine.connect() as conn:
+        df = pd.read_sql(text("SELECT player_id, position, height_in FROM nba_players"), conn)
+    height, pos = {}, {}
+    for r in df.itertuples():
+        i = prep.pidx.get(int(r.player_id))
+        if i is not None:
+            if r.height_in == r.height_in and r.height_in:
+                height[i] = float(r.height_in)
+            if r.position:
+                pos[i] = r.position
+    return height, pos
+
+
+def _lgbm_minutes(rows, side_store):
+    """con_bajas_ml: minutos del LightGBM, entrenado solo con temporadas anteriores."""
+    import lightgbm as lgb
+    from app.services.nba_lineups import fill_minutes
+    seasons = sorted({v["season"] for v in side_store.values()})
+    models = {}
+    for season in seasons:
+        train = [v for v in side_store.values() if v["season"] < season]
+        if len(train) < 1500:
+            continue
+        X = np.vstack([v["X"][~v["out"]] for v in train])
+        y = np.concatenate([v["actual"][~v["out"]] for v in train])
+        models[season] = lgb.LGBMRegressor(n_estimators=400, learning_rate=0.03, num_leaves=31, min_child_samples=50,
+                                           subsample=0.8, subsample_freq=1, colsample_bytree=0.8, reg_lambda=2.0,
+                                           verbose=-1).fit(pd.DataFrame(X, columns=MINUTES_FEATURES), y)
+    for rec in rows:
+        st = {}
+        for side in ("h", "a"):
+            v = side_store[(rec["game_id"], side)]
+            model = models.get(v["season"])
+            if model is None:
+                m = v["m_prop"]
+            else:
+                pred = np.clip(model.predict(pd.DataFrame(v["X"], columns=MINUTES_FEATURES)), 0.0, 44.0)
+                pred[v["out"]] = 0.0
+                m = fill_minutes(np.where(pred > 0.5, pred, 0.0), np.full(len(pred), 48.0))
+            st[side] = team_strength(m, v["o"], v["d"])
+        rec["con_bajas_ml_hp"], rec["con_bajas_ml_ap"] = structural(st["h"], st["a"], *rec["_pace"])
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -313,10 +378,10 @@ def fmt_table(t: pd.DataFrame) -> str:
 # Entrenamiento final (con todo) para producción
 # ══════════════════════════════════════════════════════════════════════
 
-def train_final(df: pd.DataFrame, metrics_summary: dict, feats_m, use_iso: bool) -> ModelParams:
-    mm, mt = _fit_corr(df, "con_bajas", feats_m, TOTAL_FEATURES, "ridge")
-    m = (df.con_bajas_hp - df.con_bajas_ap) + mm.predict(df[feats_m])
-    t = (df.con_bajas_hp + df.con_bajas_ap) + mt.predict(df[TOTAL_FEATURES])
+def train_final(df: pd.DataFrame, metrics_summary: dict, feats_m, use_iso: bool, base: str = "con_bajas") -> ModelParams:
+    mm, mt = _fit_corr(df, base, feats_m, TOTAL_FEATURES, "ridge")
+    m = (df[f"{base}_hp"] - df[f"{base}_ap"]) + mm.predict(df[feats_m])
+    t = (df[f"{base}_hp"] + df[f"{base}_ap"]) + mt.predict(df[TOTAL_FEATURES])
     em, et = df.margin - m, df.total - t
     sig_m = float(np.sqrt((em ** 2).mean()))
     p_raw = normal_cdf(m / sig_m)
@@ -355,6 +420,10 @@ def main():
         "v2 sin calibración": walk_forward(df, calibrate=False),
         "v2 contexto con LightGBM": walk_forward(df, method="lgbm"),
         "v2 + uso de los ausentes (3c)": walk_forward(df, feats_m=MARGIN_FEATURES + ["miss_min"]),
+        "v2 + uso absorbido por compañeros (D)": walk_forward(df, feats_m=MARGIN_FEATURES + ["usage_gap"]),
+        "v2 minutos con LightGBM": walk_forward(df, base="con_bajas_ml"),
+        "v2 minutos con LightGBM + 3c": walk_forward(df, base="con_bajas_ml", feats_m=MARGIN_FEATURES + ["miss_min"]),
+        "v2 minutos con LightGBM + D": walk_forward(df, base="con_bajas_ml", feats_m=MARGIN_FEATURES + ["usage_gap"]),
         "v2 sabiendo exactamente quién juega (techo)": walk_forward(df, base="sabe_quien"),
         "nba_possessions_v1 (actual)": from_pts(df, "v1_hp", "v1_ap", "v1"),
         "Elo": from_pts(df, "elo_m", None, "elo"),
@@ -369,12 +438,19 @@ def main():
     rep = lambda d: d[pd.to_datetime(d.game_date) >= pd.Timestamp(REPORT_FROM)]
     ll = lambda k: metrics(rep(variants[k]))["logloss"]
     # Cada pieza opcional entra solo si mejora el log loss del backtest
-    use_3c = ll("v2 + uso de los ausentes (3c)") < ll("v2 completo")
     use_iso = ll("v2 completo") < ll("v2 sin calibración")
     use_ctx = ll("v2 completo") < ll("v2 sin contexto")
-    feats_m = MARGIN_FEATURES + (["miss_min"] if use_3c else [])
-    variants["v2 ELEGIDO"] = walk_forward(df, method="ridge" if use_ctx else None, calibrate=use_iso, feats_m=feats_m)
-    choice = f"contexto {'sí' if use_ctx else 'no'} · uso de ausentes (3c) {'sí' if use_3c else 'no'} · isotónica {'sí' if use_iso else 'no'}"
+    # Minutos (proporcional o LightGBM) y ajuste por ausentes (ninguno, 3c o D): la mejor combinación
+    combos = {("con_bajas", ""): "v2 completo", ("con_bajas", "miss_min"): "v2 + uso de los ausentes (3c)",
+              ("con_bajas", "usage_gap"): "v2 + uso absorbido por compañeros (D)",
+              ("con_bajas_ml", ""): "v2 minutos con LightGBM", ("con_bajas_ml", "miss_min"): "v2 minutos con LightGBM + 3c",
+              ("con_bajas_ml", "usage_gap"): "v2 minutos con LightGBM + D"}
+    base_m, extra = min(combos, key=lambda k: ll(combos[k]))
+    feats_m = MARGIN_FEATURES + ([extra] if extra else [])
+    variants["v2 ELEGIDO"] = walk_forward(df, base=base_m, method="ridge" if use_ctx else None, calibrate=use_iso, feats_m=feats_m)
+    choice = (f"minutos {'LightGBM' if base_m == 'con_bajas_ml' else 'proporcional'} · contexto {'sí' if use_ctx else 'no'} · "
+              f"ajuste por ausentes {({'': 'no', 'miss_min': 'minutos ausentes (3c)', 'usage_gap': 'uso absorbido (D)'})[extra]} · "
+              f"isotónica {'sí' if use_iso else 'no'}")
     logger.info(f"Piezas elegidas: {choice}")
     summary = pd.DataFrame({k: metrics(rep(v)) for k, v in variants.items()}).T
     summary.index.name = "modelo"
@@ -398,7 +474,7 @@ def main():
     if args.no_save:
         return
     v2 = metrics(rep(variants["v2 ELEGIDO"]))
-    params = train_final(df, {**{k: round(v, 4) for k, v in v2.items()}, "piezas": choice}, feats_m, use_iso)
+    params = train_final(df, {**{k: round(v, 4) for k, v in v2.items()}, "piezas": choice, "minutes": base_m}, feats_m, use_iso, base=base_m)
     if not use_ctx:
         params.margin_coef, params.total_coef, params.margin_bias, params.total_bias = {}, {}, 0.0, 0.0
     params.save()
@@ -420,7 +496,7 @@ Cada partido se predice solo con información anterior a ese día. Las correccio
 
 {fmt_table(summary)}
 
-**v2 ELEGIDO** es el que va a producción: {choice}. Cada pieza opcional entra solo si baja el log loss del backtest. "v2 completo" es la versión de referencia (contexto con ridge e isotónica, sin 3c); las demás filas le quitan o le cambian una pieza.
+**v2 ELEGIDO** es el que va a producción: {choice}. Cada pieza opcional entra solo si baja el log loss del backtest. "v2 completo" es la versión de referencia (minutos proporcionales, contexto con ridge e isotónica); las demás filas le quitan, le cambian o le agregan una pieza. "Minutos con LightGBM" usa el modelo de `ml/scripts/nba_minutes_model.py`, entrenado solo con temporadas anteriores; "3c" suma los minutos de rotación ausentes y "D" el uso (tiros y pérdidas) que dejan libre.
 
 - **log loss y Brier**: calidad de la probabilidad de victoria (más bajo es mejor).
 - **MAE**: error medio en puntos del margen y del total.

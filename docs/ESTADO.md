@@ -1,6 +1,6 @@
 # OmniPicks: estado del proyecto
 
-**Actualizado:** 11-nov-2026
+**Actualizado:** 11-nov-2026 (tarde: bajas con LightGBM y reemplazos)
 
 Este documento resume todo lo hecho, lo que está en curso y lo que falta. Los planes detallados están en la misma carpeta:
 
@@ -116,6 +116,19 @@ Con el reporte de lesiones se recupera casi toda la mejora posible. El error de 
 
 **Medido y descartado:** rendimiento observado sin el jugador (3d), reparto de minutos aprendido de los partidos en que faltó cada jugador (falla 5.7 min por jugador contra 5.5 del proporcional) y ajuste por racha del equipo. Ninguno mejoró.
 
+**Mejora de las bajas (11-nov, tarde).** Al revisar el front se vio que los minutos de un pívot se iban a los bases (el reparto era proporcional, sin posición). Se rehizo así (`ml/scripts/nba_minutes_model.py`):
+- **Quién reemplaza a quién:** de las rotaciones guardadas (563,149 cambios) se cuenta, por equipo, quién entra cuando sale cada jugador, dándole más peso a lo reciente. Para jugadores sin historial con el equipo se usa el parecido por posición y estatura (tabla nueva `nba_players`, de nba_api).
+- **Modelo de minutos con LightGBM:** predice los minutos de cada jugador con 17 variables (minutos habituales, último partido, días sin jugar, reparto proporcional, reparto por reemplazos, minutos libres del equipo, rating…). Se entrena solo con temporadas anteriores. Guardado en `ml/saved_models/nba_minutes.txt`.
+
+| Reparto de minutos | Error por jugador | … con 2+ bajas | log loss del margen |
+|---|---|---|---|
+| Proporcional (antes) | 5.75 min | 7.17 | 0.596 |
+| Solo por reemplazos | 5.89 | 7.53 | 0.596 |
+| **LightGBM (usa los reemplazos como variable)** | **4.78** | **5.80** | **0.592** |
+
+- **Uso absorbido (D):** el uso (tiros y pérdidas por posesión) que deja libre cada ausente entra en la corrección; aporta lo mismo que 3c y quedó en su lugar.
+- **Ratings que no se hunden con lesiones (C):** se probó descontar el box score por partidos jugados en vez de por calendario (tipo Kalman). No cambió nada (0.5919 contra 0.5920) y no entró. El 0.0 de Jalen Williams se debe a que su 2025-26 fue flojo, no a un error.
+
 Falta de N2: calibrar la probabilidad de jugar con el historial de reportes (necesita semanas de datos), descanso de estrellas en back-to-back y química de quintetos (3e, solo si aporta).
 
 ### 2.2d NBA v2, fases N3 a N6: simulador, contexto, backtest y producción ✅
@@ -125,18 +138,20 @@ Falta de N2: calibrar la probabilidad de jugar con el historial de reportes (nec
 
 | Modelo | log loss | Brier | acierto | error del margen | error del total |
 |---|---|---|---|---|---|
-| **NBA v2 (`nba_players_v2`)** | **0.594** | **0.204** | **67.7%** | **11.02** | **14.81** |
+| **NBA v2 (`nba_players_v2`)** | **0.591** | **0.203** | **68.0%** | **10.96** | **14.80** |
 | `nba_possessions_v1` (el anterior) | 0.607 | 0.210 | 67.0% | 11.23 | 15.03 |
 | Elo | 0.617 | 0.214 | 65.4% | 11.38 | — |
 
-  v2 tiene mejor log loss que v1 en las 4 temporadas. En partidos con una baja importante la diferencia crece: 0.596 contra 0.613. Ojo: en 2025-26 v1 acertó más ganadores (69.1% contra 68.1%), aunque con peor probabilidad. Está calibrado: cuando dice 70–75%, el favorito ganó 75%.
+  v2 tiene mejor log loss que v1 en las 4 temporadas. En partidos con una baja importante la diferencia crece: 0.594 contra 0.613. Con los minutos del LightGBM, el modelo rinde igual que si supiera de antemano exactamente quién juega (0.592). Ojo: en 2025-26 v1 acertó más ganadores (69.1% contra 68.1%), aunque con peor probabilidad. Está calibrado: cuando dice 70–75%, el favorito ganó 75%.
 
 - **N6, producción:**
   - `app/services/nba_v2.py` predice los partidos del día. `prediction_engine.py` lo usa y deja v1 de respaldo si falla (o con `NBA_MODEL=v1`).
   - Las predicciones NBA ya no se duplican: se reemplaza la anterior.
   - Cuando cambia el reporte de lesiones, se vuelven a predecir los partidos de hoy.
   - Los parámetros entrenados están en `ml/saved_models/nba_v2.json` (versionado).
-  - En el front, el análisis de cada partido muestra el bloque **Bajas**: cada lesionado, su estado, sus minutos, cuántos puntos pierde su equipo sin él y a quién van sus minutos.
+  - En el front, el análisis de cada partido muestra el bloque **Bajas**, con cada equipo en una columna:
+    - cuántos puntos pierde el equipo hoy por todas sus bajas;
+    - por jugador: posición, estado y probabilidad de jugar, minutos que jugaría hoy, rating de ataque y defensa, cómo rindió el equipo con él y sin él en cancha esta temporada, impacto en puntos con su rango (±) y a quién van sus minutos (con su posición).
   - Probado: el motor predijo los 10 partidos del 11-nov; el endpoint y el front muestran v2.
 
 
