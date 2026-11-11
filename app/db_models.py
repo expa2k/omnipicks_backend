@@ -433,6 +433,7 @@ class NBAInjuryReport(Base):
     comment = Column(Text, nullable=True)
     report_date = Column(DateTime, nullable=True)         # fecha que ESPN da al reporte
     is_current = Column(Boolean, default=True, nullable=False)
+    ended_at = Column(DateTime, nullable=True)            # cuándo dejó de valer (cambió de estado o salió del reporte)
 
     __table_args__ = (
         Index("ix_nba_inj_athlete", "espn_athlete_id", "captured_at"),
@@ -481,4 +482,53 @@ class NBAPlayerRating(Base):
     __table_args__ = (
         Index("ux_nba_rating", "as_of_date", "player_id", "model_version", unique=True),
         Index("ix_nba_rating_player", "player_id", "as_of_date"),
+    )
+
+
+class NBAPredictionLog(Base):
+    """Última predicción ANTES del partido (la que se mide en vivo), con la línea del mercado."""
+    __tablename__ = "nba_prediction_log"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    game_id = Column(Integer, nullable=False)                  # games.id
+    model_name = Column(String(50), nullable=False)
+    game_date = Column(Date, nullable=False)
+    game_time = Column(DateTime, nullable=True)                # UTC
+    home_team = Column(String(100), nullable=False)
+    away_team = Column(String(100), nullable=False)
+    predicted_at = Column(DateTime, nullable=False)            # UTC
+    minutes_before_tip = Column(Float, nullable=True)
+    home_win_prob = Column(Float, nullable=False)
+    pred_margin = Column(Float, nullable=False)                # local − visita
+    pred_total = Column(Float, nullable=True)
+    market_margin = Column(Float, nullable=True)               # −spread del local (ESPN/DraftKings)
+    market_total = Column(Float, nullable=True)
+    market_provider = Column(String(50), nullable=True)
+    home_pts = Column(Integer, nullable=True)
+    away_pts = Column(Integer, nullable=True)
+    settled_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("ux_nba_log_game_model", "game_id", "model_name", unique=True),
+        Index("ix_nba_log_date", "game_date"),
+    )
+
+
+class NBAOfficialInjury(Base):
+    """Reporte oficial de lesiones de la NBA (PDF de la liga), una fila por jugador y reporte."""
+    __tablename__ = "nba_official_injuries"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    report_time = Column(DateTime, nullable=False)             # hora del reporte (ET)
+    game_date = Column(Date, nullable=False)
+    matchup = Column(String(20), nullable=True)                # BOS@TOR
+    team_name = Column(String(100), nullable=False)
+    player_name = Column(String(100), nullable=False)          # "Nombre Apellido"
+    status = Column(String(30), nullable=False)                # Out | Doubtful | Questionable | Probable | Available
+    reason = Column(String(200), nullable=True)
+    is_current = Column(Boolean, default=True, nullable=False)
+
+    __table_args__ = (
+        Index("ix_nba_off_current", "is_current", "game_date"),
+        Index("ix_nba_off_report", "report_time"),
     )

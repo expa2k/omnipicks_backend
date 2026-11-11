@@ -29,7 +29,13 @@ PLAY_PROBABILITY = {
     "Questionable": 0.50,
     "Day-To-Day": 0.50,
     "Probable": 0.85,
+    "Available": 1.0,       # solo en el reporte oficial de la NBA
 }
+
+
+def _play_probability(status: str) -> float:
+    from app.services.nba_availability import play_probability
+    return play_probability(status)
 
 
 def norm_name(name: str) -> str:
@@ -103,6 +109,7 @@ async def sync_injuries(db: AsyncSession) -> Dict[str, int]:
             continue
         if prev:
             prev.is_current = False
+            prev.ended_at = datetime.now()          # misma hora local que captured_at (NOW() de MySQL)
             changed += 1
         else:
             new += 1
@@ -118,7 +125,8 @@ async def sync_injuries(db: AsyncSession) -> Dict[str, int]:
     # Jugadores que ya no aparecen en el reporte: están disponibles de nuevo
     cleared_ids = [c.id for key, c in current_by_key.items() if key not in seen]
     if cleared_ids:
-        await db.execute(update(NBAInjuryReport).where(NBAInjuryReport.id.in_(cleared_ids)).values(is_current=False))
+        await db.execute(update(NBAInjuryReport).where(NBAInjuryReport.id.in_(cleared_ids))
+                         .values(is_current=False, ended_at=datetime.now()))
 
     await db.commit()
     result = {"total": len(reports), "new": new, "changed": changed, "cleared": len(cleared_ids)}
@@ -139,6 +147,6 @@ async def current_injuries_by_team(db: AsyncSession) -> Dict[str, List[Dict]]:
             "status": r.status,
             "injury_type": r.injury_type,
             "comment": r.comment,
-            "play_probability": PLAY_PROBABILITY.get(r.status, 0.5),
+            "play_probability": _play_probability(r.status),
         })
     return out

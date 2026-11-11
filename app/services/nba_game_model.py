@@ -317,3 +317,51 @@ def simulate_mixture(means: List[Tuple[float, float, float]], params: ModelParam
         "most_likely_score": [int(likely[0]), int(likely[1])],
         "num_simulations": n, "scenarios": len(means),
     }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Ritmo según quién juega
+# ══════════════════════════════════════════════════════════════════════
+
+PACE_PRIOR_MIN = 400.0      # minutos "virtuales" de ritmo de liga para encoger a cada jugador
+
+
+def player_pace_devs(engine) -> Dict[str, Dict[int, float]]:
+    """{temporada: {jugador: desviación de ritmo}} en posesiones por 48 min por equipo.
+
+    Para cada jugador, las posesiones por minuto mientras estuvo en cancha esa temporada
+    contra el promedio de liga, encogidas hacia 0 con PACE_PRIOR_MIN minutos. Para predecir
+    una temporada se usan solo las anteriores (ver `pace_devs_before`).
+    """
+    import pandas as pd
+    from sqlalchemy import text
+    with engine.connect() as conn:
+        st = pd.read_sql(text(
+            "SELECT g.season, s.start_t, s.end_t, s.home_players, s.away_players, s.home_poss, s.away_poss "
+            "FROM nba_stints s JOIN nba_games g USING (game_id)"), conn)
+    st["min"] = (st.end_t - st.start_t) / 600.0
+    st = st[st["min"] > 0]
+    st["poss"] = (st.home_poss + st.away_poss) / 2.0
+    out: Dict[str, Dict[int, float]] = {}
+    for season, g in st.groupby("season"):
+        league = g.poss.sum() / g["min"].sum() * 48.0
+        rows = []
+        for col in ("home_players", "away_players"):
+            ex = g[[col, "min", "poss"]].assign(pid=g[col].str.split(",")).explode("pid")
+            rows.append(ex[["pid", "min", "poss"]])
+        a = pd.concat(rows).groupby("pid")[["min", "poss"]].sum()
+        dev = (a.poss / a["min"] * 48.0 - league) * a["min"] / (a["min"] + PACE_PRIOR_MIN)
+        out[season] = {int(p): float(v) for p, v in dev.items()}
+    return out
+
+
+def pace_devs_before(devs: Dict[str, Dict[int, float]], season: str) -> Dict[int, float]:
+    """Desviación de ritmo vigente al empezar `season`: la de la temporada anterior más reciente
+    en que jugó cada jugador (las más viejas pesan menos)."""
+    out: Dict[int, float] = {}
+    prior = sorted(s for s in devs if s < season)
+    for i, s in enumerate(prior):
+        w = 0.6 ** (len(prior) - 1 - i)
+        for p, v in devs[s].items():
+            out[p] = v * w if p not in out or w == 1.0 else out[p]
+    return out

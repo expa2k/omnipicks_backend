@@ -116,6 +116,15 @@ class PredictionEngine:
             elif game.sport == SportType.NBA and game.id in nba_v2:
                 pred_result = nba_v2[game.id]
                 model_name = pred_result["simulation_details"]["model"]
+                # Medición en vivo: se guarda la predicción previa de v2 y, para comparar, la de v1
+                from app.services.nba_tracking import log_prediction
+                try:
+                    await log_prediction(self.db, game, model_name, pred_result)
+                    v1 = self.simulation_engine.simulate(game.sport, features)
+                    if v1.get("predicted_spread") is not None and not (v1.get("simulation_details") or {}).get("error"):
+                        await log_prediction(self.db, game, "nba_possessions_v1", v1)
+                except Exception as e:
+                    logger.warning(f"NBA: no se pudo guardar la predicción en el registro ({type(e).__name__}: {e})")
             else:
                 # 1. Run Models & Simulations for US Sports
                 pred_result = self.simulation_engine.simulate(game.sport, features)

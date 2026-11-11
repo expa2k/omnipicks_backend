@@ -22,8 +22,9 @@ import pandas as pd
 from sqlalchemy import text
 
 from app.services.nba_game_model import (MODEL_NAME, ModelParams, PaceState, ScheduleState, availability_scenarios,
-                                         simulate_mixture, structural, team_strength)
-from app.services.nba_injuries import PLAY_PROBABILITY, norm_name
+                                         pace_devs_before, player_pace_devs, simulate_mixture, structural, team_strength)
+from app.services.nba_availability import b2b_rest_probability, play_probability
+from app.services.nba_injuries import norm_name
 from app.services.nba_lineups import (ROTATION_MIN, Candidate, MinutesModel, ReplacementContext, expected_minutes,
                                       load_tracker, minutes_features, team_ids_by_name)
 from app.services.nba_ratings import MODEL_VERSION, meta_for
@@ -81,15 +82,32 @@ class TeamState:
         by_name = {norm_name(pred.names.get(c.player, "")): c.player for c in cands}
         self.probs: Dict[int, float] = {}
         self.report = []
-        for r in pred.injuries.get(tid, []):
-            pid = by_name.get(norm_name(r["player_name"]))
-            if pid is None:
-                continue
-            p = PLAY_PROBABILITY.get(r["status"], 0.5)
-            self.probs[pid] = p
-            self.report.append((pid, r, p))
+        # 1º el reporte oficial de la NBA (si incluye el partido de hoy); 2º ESPN para el resto
+        seen = set()
+        for source, entries in (("nba", pred.official.get(tid, [])), ("espn", pred.injuries.get(tid, []))):
+            for r in entries:
+                pid = by_name.get(norm_name(r["player_name"]))
+                if pid is None or pid in seen:
+                    continue
+                seen.add(pid)
+                p = play_probability(r["status"])
+                if p >= 1.0:
+                    continue                                # "Available" en el reporte oficial
+                self.probs[pid] = p
+                self.report.append((pid, {**r, "source": source}, p))
         # Vuelve de una ausencia: jugador de rotación que ya no aparece en el reporte
         self.returning = {c.player for c in cands if c.player not in self.probs and c.rate < 0.6 and c.base >= ROTATION_MIN}
+        # Segundo día de un back-to-back: quien suele descansar y no está en el reporte
+        last = pred.sched.games.get(tid, [])
+        if last and (pred.day - last[-1][0]).days == 1:
+            for c in cands:
+                if c.player in self.probs:
+                    continue
+                p = b2b_rest_probability(c.player)
+                if p < 1.0:
+                    self.probs[c.player] = p
+                    self.report.append((c.player, {"player_name": pred.names.get(c.player, str(c.player)),
+                                                   "status": "Rest-B2B", "injury_type": "Descanso (back-to-back)"}, p))
         self.cands = cands
         self.ids = [c.player for c in cands]
         self.o = np.array([pred.o.get(p, pred.repl_o) for p in self.ids])
@@ -161,6 +179,12 @@ class NBAv2Predictor:
                 conn, params={"a": date(season_start_year - 1, 9, 1), "d": day})
             inj = pd.read_sql(text(
                 "SELECT player_name, team_name, status, injury_type, comment FROM nba_injury_reports WHERE is_current = 1"), conn)
+            try:
+                official = pd.read_sql(text(
+                    "SELECT player_name, team_name, status, reason AS injury_type FROM nba_official_injuries "
+                    "WHERE is_current = 1 AND game_date = :d"), conn, params={"d": day})
+            except Exception:
+                official = pd.DataFrame(columns=["player_name", "team_name", "status", "injury_type"])
             players = pd.read_sql(text("SELECT player_id, position, height_in FROM nba_players"), conn)
             stints = pd.read_sql(text(
                 "SELECT s.game_id, g.home_team_id, g.away_team_id, s.home_players, s.away_players, s.home_pts, s.away_pts, "
@@ -179,6 +203,11 @@ class NBAv2Predictor:
         self.height = {int(r.player_id): float(r.height_in) for r in players.itertuples() if r.height_in == r.height_in and r.height_in}
         self.position = {int(r.player_id): r.position for r in players.itertuples() if r.position}
         self.stints = stints
+        try:
+            self.pace_dev = pace_devs_before(player_pace_devs(self.engine), self.season)
+        except Exception as e:
+            logger.warning(f"NBA v2: sin ritmo por jugador ({type(e).__name__}: {e})")
+            self.pace_dev = {}
 
         # Calendario, ritmo y eficiencia de liga, reconstruidos en orden
         poss["p"] = poss.fga + 0.44 * poss.fta + poss.tov - poss.oreb
@@ -204,6 +233,11 @@ class NBAv2Predictor:
             tid = self.team_id.get(team_name.lower())
             if tid is not None:
                 self.injuries[tid] = grp.to_dict("records")
+        self.official: Dict[int, List[Dict]] = {}
+        for team_name, grp in official.groupby("team_name"):
+            tid = self.team_id.get(team_name.lower())
+            if tid is not None:
+                self.official[tid] = grp.to_dict("records")
 
     # ── Con y sin él en cancha (stints de esta temporada) ─────────────
     def on_off(self, tid: int, player: int) -> Optional[Dict]:
@@ -246,6 +280,13 @@ class NBAv2Predictor:
         ctx = self.sched.game(self.day, self.season, season_type, h_id, a_id)
         (mh, uh), (ma, ua) = H.absence_features(), A.absence_features()
         ctx["miss_min"], ctx["usage_gap"] = mh - ma, uh - ua
+        # Ritmo según quién juega: minutos esperados hoy contra los habituales, por el ritmo de cada uno
+        ctx["pace_delta"] = 0.0
+        for T in (H, A):
+            today_m = T.minutes(T.probs)
+            usual_m = T.minutes({})
+            dev = np.array([self.pace_dev.get(p, 0.0) for p in T.ids])
+            ctx["pace_delta"] += float(((today_m - usual_m) * dev).sum() / 240.0)
         dm, dt = self.params.correction(ctx)
 
         lp, lppp = self.pace.league_pace(), self.pace.league_ppp()
@@ -287,6 +328,7 @@ class NBAv2Predictor:
                 gains = sorted(((j, float(delta[j])) for j in range(len(T.ids)) if j != i and delta[j] > 0.5), key=lambda x: -x[1])
                 injuries.append({
                     "team": side, "player": r["player_name"], "status": r["status"], "injury": r["injury_type"],
+                    "source": r.get("source", "modelo"),
                     "play_probability": p, "usual_minutes": round(float(with_m[i]), 1),
                     "position": self.position.get(pid), "position_label": POSITION_LABEL.get(self.position.get(pid) or "", None),
                     "o_rating": round(float(T.o[i]), 1), "d_rating": round(float(T.d[i]), 1),

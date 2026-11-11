@@ -138,7 +138,7 @@ Falta de N2: calibrar la probabilidad de jugar con el historial de reportes (nec
 
 | Modelo | log loss | Brier | acierto | error del margen | error del total |
 |---|---|---|---|---|---|
-| **NBA v2 (`nba_players_v2`)** | **0.591** | **0.203** | **68.0%** | **10.96** | **14.80** |
+| **NBA v2 (`nba_players_v2`)** | **0.591** | **0.203** | **68.0%** | **10.97** | **14.78** |
 | `nba_possessions_v1` (el anterior) | 0.607 | 0.210 | 67.0% | 11.23 | 15.03 |
 | Elo | 0.617 | 0.214 | 65.4% | 11.38 | — |
 
@@ -218,11 +218,24 @@ Falta de N2: calibrar la probabilidad de jugar con el historial de reportes (nec
 | N6 | Integración con el pipeline, el endpoint y el front (**solo el impacto de las bajas**) | mediano | ✅ hecho; falta verlo correr solo una semana |
 | N7 | Proyecciones por jugador (puntos, rebotes, asistencias) | mediano | ❌ opcional |
 
+**Medición en vivo y mejoras del 11-nov:**
+- **Registro de predicciones** (`nba_prediction_log`, `app/services/nba_tracking.py`):
+  - se guarda la última predicción de cada partido **antes** de que empiece, de v2 y de v1, con la línea de ESPN (DraftKings) de ese momento;
+  - se liquida sola con el marcador real (con la fecha exacta, porque hay series de 2 partidos seguidos en la misma sede);
+  - endpoint `GET /api/predictions/nba/performance`: acierto, log loss, error del margen y del total, y contra el mercado (quién quedó más cerca y acierto contra el spread);
+  - el dashboard muestra **"Modelo NBA en vivo"** (v2 contra v1 contra mercado, y los últimos resultados) y, mientras no haya partidos terminados, la referencia del backtest.
+- **Probabilidad de jugar aprendida** (`app/services/nba_availability.py`): por estado, con los reportes guardados contra quién jugó de verdad. Se mezcla con la inicial como si fueran 20 casos, así que hoy casi manda la inicial. Se recalcula sola cada día. Para esto se agregó `ended_at` a los reportes de ESPN (cuándo dejan de valer).
+- **Descanso en back-to-back:** en el segundo día seguido, los jugadores de rotación faltan 15.8% de las veces, contra 12.5% normal. Hay 116 jugadores con un exceso claro (por ejemplo, Horford faltó 10 de 13). A quien no está en el reporte se le aplica la mitad de ese exceso, porque parte de esas ausencias fueron lesiones que sí se reportan. **No se puede validar con el backtest** (no hay reportes viejos); se medirá en vivo.
+- **Ritmo según quién juega:** ritmo de cada jugador mientras está en cancha (de los stints de temporadas anteriores). Si faltan jugadores rápidos o lentos, cambia el total esperado. El error del total baja de 14.80 a 14.78 y entró.
+- **Reporte oficial de lesiones de la NBA** (`app/services/nba_official_injuries.py`): el PDF que la liga publica cada 15 min en official.nba.com, leído con `pdfplumber`. Trae Questionable, Doubtful, Probable y Available (ESPN casi solo da Out y Day-To-Day) y el motivo (lesión, descanso, G League). Es la fuente principal para los partidos que incluye; ESPN queda de respaldo. Se lee cada 30 min junto con ESPN y, si cambia, se vuelve a predecir.
+- **En el front:** cada baja muestra el motivo y la fuente (reporte oficial NBA, ESPN o historial del jugador).
+
 **Lo que queda de NBA:**
 - Dejar correr el servidor una semana y revisar que la actualización diaria y las lesiones no fallen (criterio de N6).
-- Calibrar la probabilidad de jugar por estado con el historial de reportes (necesita semanas de datos).
+- Dejar que se junten semanas de reportes para que la probabilidad de jugar aprendida pese más que la inicial, y para validar el descanso en back-to-back.
 - Comparar contra el mercado hacia adelante (no hay líneas históricas gratis de NBA).
-- Ritmo según los jugadores disponibles, descanso de estrellas en back-to-back y química de quintetos (3e).
+- Química de quintetos (3e): efecto chico y fácil de sobreajustar; no se ha probado.
+- Proyecciones por jugador (N7, opcional).
 
 **Decisiones ya tomadas:**
 - El mercado **no entra al modelo**; solo se usa para comparar.

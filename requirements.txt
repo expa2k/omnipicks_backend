@@ -39,3 +39,6 @@ python-dateutil==2.9.0
 pytz==2024.2
 tenacity==9.0.0
 loguru==0.7.3
+
+# === NBA: reporte oficial de lesiones (PDF) ===
+pdfplumber==0.11.4

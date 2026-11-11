@@ -219,9 +219,13 @@ La NBA queda **100% gratis**: no gasta API-Sports y The Odds API es opcional, so
 
 **Decididos por el backtest** (entran solo si bajan el log loss; el script elige solo): la corrección de contexto, el ajuste por uso de los ausentes (3c) y la calibración isotónica. La elección vigente está en [`NBA_BACKTEST.md`](NBA_BACKTEST.md).
 
+**Hecho el 11-nov (tarde):**
+- Medición en vivo contra resultado y mercado (`nba_prediction_log` y `/api/predictions/nba/performance`).
+- Probabilidad de jugar aprendida por estado (necesita semanas de reportes para pesar).
+- Descanso en back-to-back por jugador (aplicado a la mitad; se valida en vivo).
+- Ritmo según quién juega (error del total 14.80 → 14.78).
+- Reporte oficial de lesiones de la NBA (PDF) como fuente principal.
+
 **Pendiente:**
-- Calibrar la probabilidad de jugar por estado con el historial de reportes (hace falta juntar semanas de reportes).
-- Descanso de estrellas en back-to-back, aprendido por jugador.
 - Química de quintetos (3e), solo si aporta.
-- Comparación contra el mercado hacia adelante: no hay líneas históricas gratis de NBA.
-- Ritmo según los jugadores disponibles (hoy el ritmo es por equipo).
+- Proyecciones por jugador (N7).

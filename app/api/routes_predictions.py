@@ -463,3 +463,14 @@ async def get_prediction_history(
             for p in picks
         ],
     }
+
+
+@router.get("/nba/performance")
+async def get_nba_performance(
+    days: Optional[int] = Query(None, description="Solo los últimos N días"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Rendimiento en vivo del modelo NBA: predicción previa a cada partido contra el resultado y el mercado."""
+    from app.services.nba_tracking import performance, settle
+    await settle(db)
+    return await performance(db, days)

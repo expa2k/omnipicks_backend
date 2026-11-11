@@ -4,7 +4,7 @@ OmniPicks — NBA v2: tareas programadas (todas gratis, sin cuota).
 - Al arrancar (pensado para prender la PC solo cuando se quiere): se pone al día con lo
   que pasó mientras estuvo apagada (box scores, stints y ratings), carga los partidos NBA
   de hoy y mañana desde ESPN y los predice. Nada de esto gasta cuota de pago.
-- Lesiones de ESPN: cada 30 minutos; si el reporte cambió, se vuelven a predecir los
+- Lesiones (reporte oficial de la NBA y ESPN): cada 30 minutos; si alguno cambió, se vuelven a predecir los
   partidos NBA de hoy y mañana. En cada vuelta también revisa si los ratings son de un
   día anterior (p. ej. la PC estaba dormida a las 04:30) y, si es así, se pone al día.
 - Histórico: una vez al día a las 04:30 ET, lo mismo que al arrancar.
@@ -49,12 +49,24 @@ async def rerun_nba_predictions(reason: str):
             logger.warning(f"Predicciones NBA de {day}: no se pudieron recalcular ({type(e).__name__}: {e})")
 
 
+async def settle_predictions():
+    """Liquida las predicciones registradas cuyos partidos ya terminaron."""
+    from app.services.nba_tracking import settle
+    try:
+        async with get_session_factory()() as db:
+            return await settle(db)
+    except Exception as e:
+        logger.warning(f"NBA: no se pudieron liquidar predicciones ({type(e).__name__}: {e})")
+        return 0
+
+
 async def ingest_nba_schedule():
-    """Partidos NBA de hoy y mañana desde ESPN (gratis; no usa API-Sports ni The Odds API)."""
+    """Partidos NBA de ayer, hoy y mañana desde ESPN (gratis; no usa API-Sports ni The Odds API).
+    Ayer, para actualizar marcadores finales."""
     from app.services.data_ingestion import DataIngestionService
     today = today_et()
     total = 0
-    for day in (today, today + timedelta(days=1)):
+    for day in (today - timedelta(days=1), today, today + timedelta(days=1)):
         try:
             async with get_session_factory()() as db:
                 total += await DataIngestionService(db)._ingest_nba_espn(day)
@@ -84,6 +96,7 @@ async def catch_up(reason: str) -> bool:
     logger.info(f"🏀 Poniéndose al día con la NBA ({reason})...")
     await job_update_history(rerun=False)
     await ingest_nba_schedule()
+    await settle_predictions()
     await rerun_nba_predictions(reason)
     return True
 
@@ -100,9 +113,22 @@ async def job_sync_injuries():
     except Exception as e:
         logger.warning(f"Lesiones NBA: no se pudo actualizar ({type(e).__name__}: {e})")
         return
-    # Se re-simula solo si cambió algo en el reporte
-    if result.get("new") or result.get("changed") or result.get("cleared"):
-        await rerun_nba_predictions(f"lesiones: {result}")
+    await settle_predictions()
+    # Reporte oficial de la NBA (PDF cada 15 min); si falla, queda ESPN
+    official = {}
+    try:
+        from sqlalchemy import create_engine
+        from app.services.nba_official_injuries import sync_official_sync
+        eng = create_engine(get_settings().mysql_url_sync, pool_pre_ping=True)
+        try:
+            official = await asyncio.to_thread(sync_official_sync, eng, today_et())
+        finally:
+            eng.dispose()
+    except Exception as e:
+        logger.warning(f"Reporte oficial NBA: no se pudo leer ({type(e).__name__}: {e})")
+    # Se re-simula solo si cambió algo en alguno de los dos reportes
+    if result.get("new") or result.get("changed") or result.get("cleared") or official.get("changed"):
+        await rerun_nba_predictions(f"lesiones: ESPN {result} · oficial {official.get('changed', 0)} cambios")
 
 
 def update_history_sync() -> dict:
@@ -124,6 +150,12 @@ def update_history_sync() -> dict:
                 done, failed = load_stints(engine, seasons)
                 # Ratings de jugador vigentes hoy, ya con los partidos de ayer
                 ratings = build_and_store(engine, first_output=None, today=today_et())
+                # Probabilidad de jugar (por estado y descanso en back-to-back) con lo nuevo
+                try:
+                    from app.services.nba_availability import update as update_availability
+                    update_availability(engine)
+                except Exception as e:
+                    logger.warning(f"Disponibilidad NBA: no se pudo recalcular ({type(e).__name__}: {e})")
             finally:
                 lock_conn.execute(text("SELECT RELEASE_LOCK(:n)"), {"n": _LOCK_NAME})
         return {"skipped": False, "games": games, "stints_done": done, "stints_failed": failed, "ratings": ratings}

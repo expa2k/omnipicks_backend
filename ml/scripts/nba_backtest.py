@@ -134,6 +134,9 @@ def collect(prep: Prepared, cfg: RatingConfig) -> pd.DataFrame:
         sched.season_end[season] = reg.game_date.max()
     pace, v1, tracker = PaceState(), V1State(), RosterTracker()
     subs = load_substitutions(games.game_id.tolist())
+    from app.services.nba_game_model import pace_devs_before, player_pace_devs
+    all_devs = player_pace_devs(create_engine(get_settings().mysql_url_sync))
+    devs_by_season = {s: pace_devs_before(all_devs, s) for s in games.season.unique()}
     height, pos = _player_info(prep)
     last_team_game = {}
     fed = [0]
@@ -169,7 +172,7 @@ def collect(prep: Prepared, cfg: RatingConfig) -> pd.DataFrame:
             ctx = sched.game(r.day, g.season, g.season_type, h, a)
             rec = {"game_id": g.game_id, "game_date": g.game_date, "season": g.season, "season_type": g.season_type,
                    "home": h, "away": a, "home_pts": g.home_pts, "away_pts": g.away_pts, **ctx,
-                   "outs": 0, "key_out": False, "miss_min": 0.0, "usage_gap": 0.0}
+                   "outs": 0, "key_out": False, "miss_min": 0.0, "usage_gap": 0.0, "pace_delta": 0.0}
             strengths = {s: {} for s in SETTINGS}
             ok = True
             for side, tid in (("h", h), ("a", a)):
@@ -193,7 +196,11 @@ def collect(prep: Prepared, cfg: RatingConfig) -> pd.DataFrame:
                     "X": minutes_features(tracker, cands, r.day, outs, back, m_prop, m_rep, (r.o + r.d)[ids], rest),
                     "out": np.array([c.player in outs for c in cands]),
                     "actual": np.array([act_min[list(act_p).index(p)] if p in act else 0.0 for p in ids.tolist()])}
-                proj = {"sin_info": expected_minutes(cands)[0],
+                usual = expected_minutes(cands)[0]
+                dev = devs_by_season[g.season]
+                pdev = np.array([dev.get(int(prep.player_ids[p]), 0.0) for p in ids])
+                rec["pace_delta"] += float(((m_prop - usual) * pdev).sum() / 240.0)
+                proj = {"sin_info": usual,
                         "con_bajas": m_prop,
                         "sabe_quien": expected_minutes(cands, {**absent, **present})[0]}
                 for s, m in proj.items():
@@ -288,9 +295,10 @@ def _fit_corr(train, base, feats_m, feats_t, method):
 
 
 def walk_forward(df: pd.DataFrame, base: str = "con_bajas", method: Optional[str] = "ridge",
-                 calibrate: bool = True, feats_m=None) -> pd.DataFrame:
+                 calibrate: bool = True, feats_m=None, feats_t=None) -> pd.DataFrame:
     """Predicciones corregidas fuera de muestra: cada mes se entrena con lo anterior."""
     feats_m = feats_m or MARGIN_FEATURES
+    feats_t = feats_t or TOTAL_FEATURES
     out = df[["game_id", "game_date", "season", "margin", "total", "key_out", "outs"]].copy()
     m = (df[f"{base}_hp"] - df[f"{base}_ap"]).to_numpy(float)
     t = (df[f"{base}_hp"] + df[f"{base}_ap"]).to_numpy(float)
@@ -302,9 +310,9 @@ def walk_forward(df: pd.DataFrame, base: str = "con_bajas", method: Optional[str
             te = (month == mo).to_numpy()
             if tr.sum() < 300:
                 continue
-            mm, mt = _fit_corr(df[tr], base, feats_m, TOTAL_FEATURES, method)
+            mm, mt = _fit_corr(df[tr], base, feats_m, feats_t, method)
             pm[te] = m[te] + mm.predict(df.loc[te, feats_m])
-            pt[te] = t[te] + mt.predict(df.loc[te, TOTAL_FEATURES])
+            pt[te] = t[te] + mt.predict(df.loc[te, feats_t])
     out["pred_m"], out["pred_t"] = pm, pt
     # σ del margen: RMSE de los errores anteriores (en el calentamiento se usa 13)
     err = (out.margin - out.pred_m) ** 2
@@ -378,17 +386,19 @@ def fmt_table(t: pd.DataFrame) -> str:
 # Entrenamiento final (con todo) para producción
 # ══════════════════════════════════════════════════════════════════════
 
-def train_final(df: pd.DataFrame, metrics_summary: dict, feats_m, use_iso: bool, base: str = "con_bajas") -> ModelParams:
-    mm, mt = _fit_corr(df, base, feats_m, TOTAL_FEATURES, "ridge")
+def train_final(df: pd.DataFrame, metrics_summary: dict, feats_m, use_iso: bool, base: str = "con_bajas",
+                feats_t=None) -> ModelParams:
+    feats_t = feats_t or TOTAL_FEATURES
+    mm, mt = _fit_corr(df, base, feats_m, feats_t, "ridge")
     m = (df[f"{base}_hp"] - df[f"{base}_ap"]) + mm.predict(df[feats_m])
-    t = (df[f"{base}_hp"] + df[f"{base}_ap"]) + mt.predict(df[TOTAL_FEATURES])
+    t = (df[f"{base}_hp"] + df[f"{base}_ap"]) + mt.predict(df[feats_t])
     em, et = df.margin - m, df.total - t
     sig_m = float(np.sqrt((em ** 2).mean()))
     p_raw = normal_cdf(m / sig_m)
     iso = IsotonicRegression(out_of_bounds="clip", y_min=0.01, y_max=0.99).fit(p_raw, df.margin > 0)
     grid = np.linspace(0.01, 0.99, 50)
     return ModelParams(
-        margin_coef=dict(zip(feats_m, map(float, mm.coef_))), total_coef=dict(zip(TOTAL_FEATURES, map(float, mt.coef_))),
+        margin_coef=dict(zip(feats_m, map(float, mm.coef_))), total_coef=dict(zip(feats_t, map(float, mt.coef_))),
         margin_bias=float(mm.intercept_), total_bias=float(mt.intercept_),
         sigma_margin=sig_m, sigma_total=float(np.sqrt((et ** 2).mean())), rho=float(np.corrcoef(em, et)[0, 1]),
         iso_x=grid.tolist() if use_iso else [], iso_y=(0.5 * iso.predict(grid) + 0.5 * grid).tolist() if use_iso else [],
@@ -424,6 +434,8 @@ def main():
         "v2 minutos con LightGBM": walk_forward(df, base="con_bajas_ml"),
         "v2 minutos con LightGBM + 3c": walk_forward(df, base="con_bajas_ml", feats_m=MARGIN_FEATURES + ["miss_min"]),
         "v2 minutos con LightGBM + D": walk_forward(df, base="con_bajas_ml", feats_m=MARGIN_FEATURES + ["usage_gap"]),
+        "v2 minutos con LightGBM + D + ritmo por jugadores": walk_forward(
+            df, base="con_bajas_ml", feats_m=MARGIN_FEATURES + ["usage_gap"], feats_t=TOTAL_FEATURES + ["pace_delta"]),
         "v2 sabiendo exactamente quién juega (techo)": walk_forward(df, base="sabe_quien"),
         "nba_possessions_v1 (actual)": from_pts(df, "v1_hp", "v1_ap", "v1"),
         "Elo": from_pts(df, "elo_m", None, "elo"),
@@ -447,10 +459,16 @@ def main():
               ("con_bajas_ml", "usage_gap"): "v2 minutos con LightGBM + D"}
     base_m, extra = min(combos, key=lambda k: ll(combos[k]))
     feats_m = MARGIN_FEATURES + ([extra] if extra else [])
-    variants["v2 ELEGIDO"] = walk_forward(df, base=base_m, method="ridge" if use_ctx else None, calibrate=use_iso, feats_m=feats_m)
+    chosen = walk_forward(df, base=base_m, method="ridge" if use_ctx else None, calibrate=use_iso, feats_m=feats_m)
+    # Ritmo según quién juega: entra si baja el error del total
+    feats_t = TOTAL_FEATURES + ["pace_delta"]
+    with_pace = walk_forward(df, base=base_m, method="ridge" if use_ctx else None, calibrate=use_iso, feats_m=feats_m, feats_t=feats_t)
+    use_pace = use_ctx and metrics(rep(with_pace))["MAE total"] < metrics(rep(chosen))["MAE total"]
+    variants["v2 ELEGIDO"] = with_pace if use_pace else chosen
+    feats_t = feats_t if use_pace else TOTAL_FEATURES
     choice = (f"minutos {'LightGBM' if base_m == 'con_bajas_ml' else 'proporcional'} · contexto {'sí' if use_ctx else 'no'} · "
               f"ajuste por ausentes {({'': 'no', 'miss_min': 'minutos ausentes (3c)', 'usage_gap': 'uso absorbido (D)'})[extra]} · "
-              f"isotónica {'sí' if use_iso else 'no'}")
+              f"ritmo por jugadores {'sí' if use_pace else 'no'} · isotónica {'sí' if use_iso else 'no'}")
     logger.info(f"Piezas elegidas: {choice}")
     summary = pd.DataFrame({k: metrics(rep(v)) for k, v in variants.items()}).T
     summary.index.name = "modelo"
@@ -474,7 +492,7 @@ def main():
     if args.no_save:
         return
     v2 = metrics(rep(variants["v2 ELEGIDO"]))
-    params = train_final(df, {**{k: round(v, 4) for k, v in v2.items()}, "piezas": choice, "minutes": base_m}, feats_m, use_iso, base=base_m)
+    params = train_final(df, {**{k: round(v, 4) for k, v in v2.items()}, "piezas": choice, "minutes": base_m}, feats_m, use_iso, base=base_m, feats_t=feats_t)
     if not use_ctx:
         params.margin_coef, params.total_coef, params.margin_bias, params.total_bias = {}, {}, 0.0, 0.0
     params.save()
