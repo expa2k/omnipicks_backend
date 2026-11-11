@@ -2,16 +2,25 @@
 OmniPicks — ML: Value Calculator Stub
 """
 from typing import List, Dict, Any
-from app.db_models import Prediction, OddsSnapshot, MarketType
+from app.db_models import Prediction, OddsSnapshot, MarketType, SportType
 import math
+
+# Desviación típica histórica del total de puntos (deportes de marcador alto → Normal)
+_TOTAL_SD = {SportType.NBA: 17.0, SportType.NFL: 13.5}
 
 class ValueCalculator:
     def _poisson_prob(self, lam: float, k: int) -> float:
-        """Probability of exactly k events given expected lam."""
-        return (math.exp(-lam) * (lam ** k)) / math.factorial(k)
-        
-    def _calc_under_prob(self, expected_total: float, line: float) -> float:
-        """Calculate probability of total goals/runs being strictly UNDER the line."""
+        """Probability of exactly k events given expected lam (en log para evitar overflow)."""
+        if lam <= 0:
+            return 1.0 if k == 0 else 0.0
+        return math.exp(k * math.log(lam) - lam - math.lgamma(k + 1))
+
+    def _calc_under_prob(self, expected_total: float, line: float, sport=None) -> float:
+        """Probabilidad de que el total quede estrictamente BAJO la línea.
+        Fútbol/MLB: Poisson. NBA/NFL: Normal (Poisson subestima mucho la varianza)."""
+        if sport in _TOTAL_SD:
+            sd = _TOTAL_SD[sport]
+            return 0.5 * (1 + math.erf((line - expected_total) / (sd * math.sqrt(2))))
         prob = 0.0
         for k in range(int(math.ceil(line))):
             prob += self._poisson_prob(expected_total, k)
@@ -123,7 +132,7 @@ class ValueCalculator:
                         best_picks[key] = best_sp_pick
                         
             elif odds.market == MarketType.OVER_UNDER and odds.total_line and prediction.predicted_total:
-                under_prob = self._calc_under_prob(prediction.predicted_total, odds.total_line)
+                under_prob = self._calc_under_prob(prediction.predicted_total, odds.total_line, prediction.sport)
                 over_prob = 1.0 - under_prob
                 
                 ev_over = 0

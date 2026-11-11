@@ -212,10 +212,11 @@ class DataIngestionService:
             logger.info(f"Ingested {count} NFL games from ESPN for {date_str}")
             return count
 
-        # ── NBA / MLB via API-Sports ────────────────────────────────────────
         if sport == SportType.NBA:
-            games = await self.apisports.get_nba_games(date_str)
-        elif sport == SportType.MLB:
+            return await self._ingest_nba_espn(target_date)
+
+        # ── MLB via API-Sports ──────────────────────────────────────────────
+        if sport == SportType.MLB:
             games = await self.apisports.get_mlb_games(date_str)
         else:
             return 0
@@ -233,10 +234,6 @@ class DataIngestionService:
             if sport == SportType.MLB and league_name != "MLB":
                 continue
 
-            # Filter NBA to only include the actual NBA league
-            if sport == SportType.NBA and league_name not in ["NBA", "NBA - Playoffs", "NBA - Finals"]:
-                continue
-            
             # Upsert teams
             home_team = await self._upsert_team(
                 sport=sport,
@@ -288,6 +285,52 @@ class DataIngestionService:
 
         await self.db.commit()
         logger.info(f"Ingested {count} {sport.value} games for {date_str}")
+        return count
+
+    async def _ingest_nba_espn(self, target_date: date) -> int:
+        """NBA desde ESPN (gratis). API-Sports devolvía la liga como "standard"
+        y usa "visitors" en vez de "away", así que el filtro anterior descartaba todo."""
+        from app.services.espn_nba_client import get_nba_games_espn
+
+        games = await get_nba_games_espn(target_date)
+        count = 0
+        for g in games:
+            home_data = g["teams"]["home"]
+            away_data = g["teams"]["away"]
+            if not home_data.get("id") or not away_data.get("id"):
+                continue
+
+            home_team = await self._upsert_team(
+                sport=SportType.NBA, external_id=f"espn_{home_data['id']}",
+                name=home_data["name"], short_name=home_data.get("abbreviation"),
+                logo_url=home_data.get("logo"), league="NBA",
+            )
+            away_team = await self._upsert_team(
+                sport=SportType.NBA, external_id=f"espn_{away_data['id']}",
+                name=away_data["name"], short_name=away_data.get("abbreviation"),
+                logo_url=away_data.get("logo"), league="NBA",
+            )
+
+            season_start = target_date.year if target_date.month >= 10 else target_date.year - 1
+            await self._upsert_game(
+                sport=SportType.NBA,
+                external_id=f"espn_{g['id']}",
+                home_team=home_team,
+                away_team=away_team,
+                game_date=target_date,           # ESPN `dates` ya es el día ET
+                game_time=self._parse_datetime(g.get("date")),
+                league="NBA",
+                season=str(season_start),
+                status=self._map_us_status(g["status"]["short"]),
+                venue=g.get("venue", {}).get("name") or None,
+                home_score=g["scores"]["home"]["total"],
+                away_score=g["scores"]["away"]["total"],
+                raw_data=g,
+            )
+            count += 1
+
+        await self.db.commit()
+        logger.info(f"Ingested {count} NBA games from ESPN for {target_date.isoformat()}")
         return count
 
     async def ingest_daily_games(self, target_date: date):

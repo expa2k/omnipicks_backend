@@ -338,3 +338,123 @@ class ModelPerformance(Base):
     __table_args__ = (
         Index("idx_perf_model_sport", "model_name", "sport", "date"),
     )
+
+
+# ══════════════════════════════════════════════════════════════════════
+# NBA v2 — histórico propio (fuente: nba_api / ESPN)
+# ══════════════════════════════════════════════════════════════════════
+
+class NBAGame(Base):
+    """Un partido de NBA (id oficial de la NBA)."""
+    __tablename__ = "nba_games"
+
+    game_id = Column(String(12), primary_key=True)
+    season = Column(String(7), nullable=False)            # '2026-27'
+    season_type = Column(String(20), nullable=False)      # 'Regular Season' | 'Playoffs'
+    game_date = Column(Date, nullable=False)
+    home_team_id = Column(Integer, nullable=False)
+    away_team_id = Column(Integer, nullable=False)
+    home_pts = Column(Integer, nullable=True)
+    away_pts = Column(Integer, nullable=True)
+    stints_done = Column(Boolean, default=False, nullable=False)
+
+    __table_args__ = (
+        Index("ix_nba_games_date", "game_date"),
+        Index("ix_nba_games_season", "season", "season_type"),
+    )
+
+
+class NBAPlayerGame(Base):
+    """Box score de un jugador en un partido."""
+    __tablename__ = "nba_player_games"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    game_id = Column(String(12), nullable=False)
+    season = Column(String(7), nullable=False)
+    game_date = Column(Date, nullable=False)
+    team_id = Column(Integer, nullable=False)
+    opp_team_id = Column(Integer, nullable=False)
+    is_home = Column(Boolean, nullable=False)
+    player_id = Column(Integer, nullable=False)
+    player_name = Column(String(100), nullable=False)
+    minutes = Column(Float, nullable=False, default=0.0)
+    pts = Column(Integer, default=0)
+    fgm = Column(Integer, default=0)
+    fga = Column(Integer, default=0)
+    fg3m = Column(Integer, default=0)
+    fg3a = Column(Integer, default=0)
+    ftm = Column(Integer, default=0)
+    fta = Column(Integer, default=0)
+    oreb = Column(Integer, default=0)
+    dreb = Column(Integer, default=0)
+    ast = Column(Integer, default=0)
+    stl = Column(Integer, default=0)
+    blk = Column(Integer, default=0)
+    tov = Column(Integer, default=0)
+    pf = Column(Integer, default=0)
+    plus_minus = Column(Float, default=0.0)
+
+    __table_args__ = (
+        Index("ux_nba_pg_game_player", "game_id", "player_id", unique=True),
+        Index("ix_nba_pg_player_date", "player_id", "game_date"),
+        Index("ix_nba_pg_team_date", "team_id", "game_date"),
+    )
+
+
+class NBAStint(Base):
+    """Tramo de partido con los mismos 10 jugadores en cancha."""
+    __tablename__ = "nba_stints"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    game_id = Column(String(12), nullable=False)
+    start_t = Column(Integer, nullable=False)             # décimas de segundo desde el inicio
+    end_t = Column(Integer, nullable=False)
+    home_players = Column(String(80), nullable=False)     # 5 ids ordenados, separados por coma
+    away_players = Column(String(80), nullable=False)
+    home_pts = Column(Integer, nullable=False, default=0)
+    away_pts = Column(Integer, nullable=False, default=0)
+    home_poss = Column(Integer, nullable=False, default=0)
+    away_poss = Column(Integer, nullable=False, default=0)
+
+    __table_args__ = (Index("ix_nba_stints_game", "game_id"),)
+
+
+class NBAInjuryReport(Base):
+    """Cada cambio de estado de lesión visto en ESPN (historial point-in-time)."""
+    __tablename__ = "nba_injury_reports"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    captured_at = Column(DateTime, server_default=func.now(), nullable=False)
+    espn_athlete_id = Column(String(20), nullable=False)
+    player_name = Column(String(100), nullable=False)
+    team_name = Column(String(100), nullable=False)
+    status = Column(String(30), nullable=False)           # Out | Doubtful | Questionable | Probable | Day-To-Day
+    injury_type = Column(String(100), nullable=True)
+    comment = Column(Text, nullable=True)
+    report_date = Column(DateTime, nullable=True)         # fecha que ESPN da al reporte
+    is_current = Column(Boolean, default=True, nullable=False)
+
+    __table_args__ = (
+        Index("ix_nba_inj_athlete", "espn_athlete_id", "captured_at"),
+        Index("ix_nba_inj_current", "is_current"),
+    )
+
+
+class NBAPlayerRating(Base):
+    """Rating de un jugador en una fecha (se usa solo info anterior a esa fecha)."""
+    __tablename__ = "nba_player_ratings"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    as_of_date = Column(Date, nullable=False)
+    player_id = Column(Integer, nullable=False)
+    player_name = Column(String(100), nullable=True)
+    o_rating = Column(Float, nullable=False)              # pts/100 pos sobre el promedio (ataque)
+    d_rating = Column(Float, nullable=False)              # pts/100 pos sobre el promedio (defensa; + = bueno)
+    uncertainty = Column(Float, nullable=True)
+    minutes_sample = Column(Float, nullable=True)
+    model_version = Column(String(30), nullable=False, default="v1")
+
+    __table_args__ = (
+        Index("ux_nba_rating", "as_of_date", "player_id", "model_version", unique=True),
+        Index("ix_nba_rating_player", "player_id", "as_of_date"),
+    )

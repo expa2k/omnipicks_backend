@@ -28,7 +28,7 @@ class FeatureEngineer:
         if sport_lower == "mlb":
             return self._compute_mlb_features(game_data, game_date_str)
         elif sport_lower == "nba":
-            return self._compute_nba_features(game_data)
+            return await self._compute_nba_features(game_data, game_date_str)
         elif sport_lower == "nfl":
             return await self._compute_nfl_features(game_data)
         elif sport_lower in ["soccer", "fútbol", "futbol"]:
@@ -58,33 +58,14 @@ class FeatureEngineer:
         
         return features
 
-    def _compute_nba_features(self, game: Dict[str, Any]) -> Dict[str, Any]:
+    async def _compute_nba_features(self, game: Dict[str, Any], game_date_str: str = None) -> Dict[str, Any]:
         """
-        Básquetbol: Ritmo, Ratings (Off/Def) y 4 Factores.
+        Básquetbol: Ratings ofensivo/defensivo, ritmo, 4 factores, forma (últimos 10)
+        y back-to-backs reales. Sin valores aleatorios.
         """
         from app.services.nba_advanced_metrics import extract_advanced_nba_features
-        # Handle date dictionary format from NBA API
-        date_data = game.get("date")
-        if isinstance(date_data, dict):
-            game_date_str = date_data.get("start", "").split("T")[0] if date_data.get("start") else ""
-        else:
-            game_date_str = str(date_data).split("T")[0] if date_data else ""
-        
-        features = extract_advanced_nba_features(game, game_date_str)
-        
-        # Mantenemos las variables base requeridas
-        import random
-        random.seed(game.get("id", 1))
-        features["home_b2b"] = random.choice([0.0, 1.0])
-        features["away_b2b"] = random.choice([0.0, 1.0])
-        features["lesiones_reportadas"] = "Reporte pendiente"
-        features["home_injury_penalty"] = 0.0
-        features["away_injury_penalty"] = 0.0
-        features["adjusted_home_elo"] = round(random.uniform(1450.0, 1600.0), 1)
-        features["adjusted_away_elo"] = round(random.uniform(1450.0, 1600.0), 1)
-        random.seed()
-        
-        return features
+        # game_date_str viene de Game.game_date (día ET), que es la fecha correcta
+        return await extract_advanced_nba_features(game, game_date_str)
 
     async def _compute_nfl_features(self, game: Dict[str, Any]) -> Dict[str, Any]:
         """

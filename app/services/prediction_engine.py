@@ -4,6 +4,7 @@ Coordinates feature engineering, models, and value calculation.
 """
 import logging
 from datetime import date
+from typing import List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -27,16 +28,23 @@ class PredictionEngine:
         self.bzzoiro = BzzoiroClient()
         self.meta_model = SoccerMetaModel(self.db)
 
-    async def run_predictions_for_date(self, target_date: date):
-        """Run ML predictions for all games on a specific date."""
-        logger.info(f"Running predictions for {target_date}")
-        
-        games_result = await self.db.execute(select(Game).where(Game.game_date == target_date))
+    async def run_predictions_for_date(self, target_date: date, sports: Optional[List[SportType]] = None):
+        """Run ML predictions for the games on a specific date.
+        `sports` limita la corrida a ciertos deportes (None = todos)."""
+        logger.info(f"Running predictions for {target_date}" + (f" ({[s.value for s in sports]})" if sports else ""))
+
+        games_query = select(Game).where(Game.game_date == target_date)
+        if sports:
+            games_query = games_query.where(Game.sport.in_(sports))
+        games_result = await self.db.execute(games_query)
         games = games_result.scalars().all()
-        
-        # Clear existing picks for today to avoid duplicates
+
+        # Clear existing picks for that date (and sports) to avoid duplicates
         from sqlalchemy import delete
-        await self.db.execute(delete(Pick).where(Pick.game_date == target_date))
+        picks_delete = delete(Pick).where(Pick.game_date == target_date)
+        if sports:
+            picks_delete = picks_delete.where(Pick.sport.in_(sports))
+        await self.db.execute(picks_delete)
         await self.db.flush()
         
         for game in games:
@@ -91,7 +99,7 @@ class PredictionEngine:
             else:
                 # 1. Run Models & Simulations for US Sports
                 pred_result = self.simulation_engine.simulate(game.sport, features)
-                model_name = "monte_carlo_v1"
+                model_name = "nba_possessions_v1" if game.sport == SportType.NBA else "monte_carlo_v1"
             
             # 2. Save Prediction to DB
             prediction = Prediction(
