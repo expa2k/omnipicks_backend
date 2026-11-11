@@ -1,16 +1,19 @@
 """
 OmniPicks — NBA v2: tareas programadas (todas gratis, sin cuota).
 
+- Al arrancar (pensado para prender la PC solo cuando se quiere): se pone al día con lo
+  que pasó mientras estuvo apagada (box scores, stints y ratings), carga los partidos NBA
+  de hoy y mañana desde ESPN y los predice. Nada de esto gasta cuota de pago.
 - Lesiones de ESPN: cada 30 minutos; si el reporte cambió, se vuelven a predecir los
-  partidos NBA de hoy.
-- Histórico: una vez al día de madrugada (partidos, box scores y stints de ayer) y,
-  con eso, los ratings de jugador vigentes para hoy.
+  partidos NBA de hoy y mañana. En cada vuelta también revisa si los ratings son de un
+  día anterior (p. ej. la PC estaba dormida a las 04:30) y, si es así, se pone al día.
+- Histórico: una vez al día a las 04:30 ET, lo mismo que al arrancar.
 
 Se apaga con NBA_SCHEDULER_ENABLED=false en el .env.
 """
 import asyncio
 import logging
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -28,21 +31,69 @@ _scheduler: Optional[AsyncIOScheduler] = None
 _LOCK_NAME = "omnipicks_nba_history"
 
 
+def today_et() -> date:
+    return datetime.now(ZoneInfo(TIMEZONE)).date()
+
+
 async def rerun_nba_predictions(reason: str):
-    """Vuelve a predecir los partidos NBA de hoy (hora ET). Gratis: no usa APIs de pago."""
+    """Vuelve a predecir los partidos NBA de hoy y mañana (hora ET). Gratis: no usa APIs de pago."""
     from app.db_models import SportType
     from app.services.prediction_engine import PredictionEngine
-    today = datetime.now(ZoneInfo(TIMEZONE)).date()
+    today = today_et()
+    for day in (today, today + timedelta(days=1)):
+        try:
+            async with get_session_factory()() as db:
+                await PredictionEngine(db).run_predictions_for_date(day, sports=[SportType.NBA])
+            logger.info(f"Predicciones NBA de {day} recalculadas ({reason})")
+        except Exception as e:
+            logger.warning(f"Predicciones NBA de {day}: no se pudieron recalcular ({type(e).__name__}: {e})")
+
+
+async def ingest_nba_schedule():
+    """Partidos NBA de hoy y mañana desde ESPN (gratis; no usa API-Sports ni The Odds API)."""
+    from app.services.data_ingestion import DataIngestionService
+    today = today_et()
+    total = 0
+    for day in (today, today + timedelta(days=1)):
+        try:
+            async with get_session_factory()() as db:
+                total += await DataIngestionService(db)._ingest_nba_espn(day)
+        except Exception as e:
+            logger.warning(f"Calendario NBA de {day}: no se pudo cargar ({type(e).__name__}: {e})")
+    return total
+
+
+def ratings_are_stale() -> bool:
+    """True si los ratings guardados son de antes de hoy (falta ponerse al día)."""
+    from sqlalchemy import create_engine, text
+    from app.services.nba_ratings import MODEL_VERSION
+    engine = create_engine(get_settings().mysql_url_sync, pool_pre_ping=True)
     try:
-        async with get_session_factory()() as db:
-            await PredictionEngine(db).run_predictions_for_date(today, sports=[SportType.NBA])
-        logger.info(f"Predicciones NBA de {today} recalculadas ({reason})")
-    except Exception as e:
-        logger.warning(f"Predicciones NBA: no se pudieron recalcular ({type(e).__name__}: {e})")
+        with engine.connect() as conn:
+            last = conn.execute(text("SELECT MAX(as_of_date) FROM nba_player_ratings WHERE model_version = :v"),
+                                {"v": MODEL_VERSION}).scalar()
+        return last is None or last < today_et()
+    finally:
+        engine.dispose()
+
+
+async def catch_up(reason: str) -> bool:
+    """Si los ratings no son de hoy: histórico + ratings, calendario de ESPN y predicciones."""
+    if not await asyncio.to_thread(ratings_are_stale):
+        return False
+    logger.info(f"🏀 Poniéndose al día con la NBA ({reason})...")
+    await job_update_history(rerun=False)
+    await ingest_nba_schedule()
+    await rerun_nba_predictions(reason)
+    return True
 
 
 async def job_sync_injuries():
     from app.services.nba_injuries import sync_injuries
+    try:
+        await catch_up("ratings de un día anterior")
+    except Exception as e:
+        logger.warning(f"NBA: no se pudo poner al día ({type(e).__name__}: {e})")
     try:
         async with get_session_factory()() as db:
             result = await sync_injuries(db)
@@ -72,7 +123,7 @@ def update_history_sync() -> dict:
                 games = sum(load_season(engine, s) for s in seasons)
                 done, failed = load_stints(engine, seasons)
                 # Ratings de jugador vigentes hoy, ya con los partidos de ayer
-                ratings = build_and_store(engine, first_output=None, today=datetime.now(ZoneInfo(TIMEZONE)).date())
+                ratings = build_and_store(engine, first_output=None, today=today_et())
             finally:
                 lock_conn.execute(text("SELECT RELEASE_LOCK(:n)"), {"n": _LOCK_NAME})
         return {"skipped": False, "games": games, "stints_done": done, "stints_failed": failed, "ratings": ratings}
@@ -80,14 +131,26 @@ def update_history_sync() -> dict:
         engine.dispose()
 
 
-async def job_update_history():
+async def job_update_history(rerun: bool = True):
     try:
         result = await asyncio.to_thread(update_history_sync)
         logger.info(f"Histórico NBA actualizado: {result}")
-        if not result.get("skipped"):
+        if rerun and not result.get("skipped"):
+            await ingest_nba_schedule()
             await rerun_nba_predictions("ratings del día")
     except Exception as e:
         logger.warning(f"Histórico NBA: falló la actualización ({type(e).__name__}: {e})")
+
+
+async def job_startup():
+    """Al arrancar: ponerse al día si hace falta; si ya estaba al día, al menos cargar y predecir hoy."""
+    try:
+        if not await catch_up("arranque"):
+            if await ingest_nba_schedule():
+                await rerun_nba_predictions("arranque")
+    except Exception as e:
+        logger.warning(f"NBA: falló la puesta al día del arranque ({type(e).__name__}: {e})")
+    await job_sync_injuries()
 
 
 def start_nba_scheduler() -> Optional[AsyncIOScheduler]:
@@ -99,7 +162,7 @@ def start_nba_scheduler() -> Optional[AsyncIOScheduler]:
     _scheduler.add_job(job_sync_injuries, IntervalTrigger(minutes=30), id="nba_injuries", **common)
     _scheduler.add_job(job_update_history, CronTrigger(hour=4, minute=30), id="nba_history", **common)
     _scheduler.start()
-    asyncio.get_running_loop().create_task(job_sync_injuries())      # primera lectura al arrancar
+    asyncio.get_running_loop().create_task(job_startup())            # ponerse al día al arrancar
     logger.info("🏀 Tareas NBA programadas: lesiones cada 30 min, histórico diario 04:30 ET")
     return _scheduler
 

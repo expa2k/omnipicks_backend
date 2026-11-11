@@ -180,7 +180,14 @@ Falta de N2: calibrar la probabilidad de jugar con el historial de reportes (nec
 ---
 
 ## 3. Operación
-- **Nada corriendo en segundo plano.** El histórico ya está completo; desde ahora solo se agrega lo nuevo de cada día (lo hace el servidor a las 04:30 ET).
+- **Se usa local: se prende cuando se quiere.** No hace falta tener la PC siempre prendida. Al arrancar, el backend se pone al día solo y gratis (~1 min, más ~1–3 min por cada semana apagada):
+  1. baja los box scores y stints de los días que faltaban y recalcula los ratings;
+  2. carga desde ESPN los partidos NBA de hoy y mañana (sin gastar cuota de API-Sports ni de The Odds API);
+  3. los predice con las lesiones del momento.
+
+  Mientras está prendido, revisa las lesiones cada 30 min y vuelve a predecir si cambian. En esa misma vuelta, si los ratings quedaron de un día anterior (por ejemplo, la PC estaba dormida a las 04:30), se pone al día.
+
+  Lo que se pierde por estar apagada: los reportes de lesiones de esos días (calibrar la probabilidad de jugar tardará más) y las predicciones de los días en que no se prendió.
 - **Levantar los servidores:**
   ```bash
   # Backend sin gastar cuota (no corre el pipeline completo al arrancar; las tareas NBA sí corren)
