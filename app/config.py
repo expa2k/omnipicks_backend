@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     app_host: str = Field(default="0.0.0.0")
     frontend_url: str = Field(default="http://localhost:4200")
 
+    # === NBA v2: tareas programadas (lesiones cada 30 min, histórico diario) ===
+    nba_scheduler_enabled: bool = Field(default=True)
+    # Correr el pipeline completo al arrancar (gasta cuota de API-Sports y The Odds API)
+    run_pipeline_on_startup: bool = Field(default=True)
+
     @property
     def mysql_url(self) -> str:
         """Async MySQL connection URL for SQLAlchemy."""

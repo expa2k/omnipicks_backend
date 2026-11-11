@@ -1,0 +1,42 @@
+{
+  "margin_coef": {
+    "b2b_h": -1.4651554552824184,
+    "b2b_a": 1.6667458250110672,
+    "rest_diff": 0.2341496110451555,
+    "three_in_four_h": -0.5182665674398157,
+    "three_in_four_a": 0.19864703370641962,
+    "travel_h": -0.42157426612379206,
+    "travel_a": -0.547661915081795,
+    "east_a": 1.205030188747542,
+    "west_a": 0.4499630335157725,
+    "altitude_visit": 0.6480597685064954,
+    "playoffs": 1.8734100625488133,
+    "early_season": 0.7001491621631732,
+    "miss_min": -0.1980501276194951
+  },
+  "total_coef": {
+    "b2b_sum": 0.08063819631817122,
+    "three_in_four_sum": -0.36245071509647436,
+    "playoffs": -8.998585230828551,
+    "early_season": 0.49903591222502086,
+    "altitude_visit": 1.7826987499650098,
+    "late_season": 0.7231321523714241
+  },
+  "margin_bias": -0.15181253765257316,
+  "total_bias": 3.1806380192861727,
+  "sigma_margin": 13.82909182431207,
+  "sigma_total": 18.51464124146596,
+  "rho": -0.0017368959536655615,
+  "iso_x": [],
+  "iso_y": [],
+  "trained_until": "2026-11-09",
+  "metrics": {
+    "n": 4093,
+    "logloss": 0.5939,
+    "Brier": 0.2044,
+    "acierto": 0.6773,
+    "MAE margen": 11.02,
+    "MAE total": 14.812,
+    "piezas": "contexto sí · uso de ausentes (3c) sí · isotónica no"
+  }
+}

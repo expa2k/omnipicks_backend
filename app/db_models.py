@@ -440,6 +440,18 @@ class NBAInjuryReport(Base):
     )
 
 
+class NBAPlayerSeason(Base):
+    """Ficha de un jugador en una temporada (edad y medidas)."""
+    __tablename__ = "nba_player_seasons"
+
+    season = Column(String(7), primary_key=True)
+    player_id = Column(Integer, primary_key=True)
+    player_name = Column(String(100), nullable=True)
+    age = Column(Float, nullable=True)
+    height_in = Column(Float, nullable=True)
+    weight_lb = Column(Float, nullable=True)
+
+
 class NBAPlayerRating(Base):
     """Rating de un jugador en una fecha (se usa solo info anterior a esa fecha)."""
     __tablename__ = "nba_player_ratings"

@@ -1,6 +1,6 @@
 # OmniPicks NBA v2: plan del modelo
 
-**Fecha:** 10-nov-2026 · **Estado:** solo plan, todavía no se implementa nada.
+**Fecha:** 10-nov-2026 · **Estado:** N0–N6 implementados (ver la sección 12 y [`NBA_BACKTEST.md`](NBA_BACKTEST.md)).
 
 ## Principios (acordados)
 1. **El modelo no usa el mercado de apuestas.** Las líneas (ESPN/DraftKings, The Odds API) se guardan **solo para comparar**: modelo contra mercado, medición de qué tan lejos o cerca estamos, y detección de diferencias.
@@ -195,3 +195,31 @@ La NBA queda **100% gratis**: no gasta API-Sports y The Odds API es opcional, so
 
    Es una corrida única de unas 3–5 horas, que se puede pausar y reanudar.
 4. **Dependencias**: aprobado instalar `lightgbm`, `scikit-learn` y las que hagan falta.
+
+## 12. Estado de la implementación (10-nov-2026)
+
+| Fase | Estado | Dónde | Notas |
+|---|---|---|---|
+| N0. Datos | ✅ | `app/services/nba_history.py`, `nba_injuries.py`, `nba_scheduler.py`, `ml/scripts/nba_backfill.py` | Los puntos de los stints se cuentan por evento (la primera versión los duplicaba en ~15% de los partidos). Lesiones cada 30 min; histórico y ratings a las 04:30 ET. |
+| N1. Ratings de jugador | ✅ | `app/services/nba_ratings.py` | 2a, 2b y 2c en **una sola regresión** sobre los stints: el perfil de box score (filtro bayesiano con descuento, más minutos y edad) entra como variable y el RAPM es el residuo propio de cada jugador, con ridge y decaimiento. Se recalcula cada día (~20 s). |
+| N2. Bajas | ✅ parcial | `app/services/nba_lineups.py` | 3a (probabilidad por estado), 3b (reparto proporcional con tope), impacto de cada baja. |
+| N3. Simulador | ✅ | `app/services/nba_game_model.py` | Escenarios de quién juega: con hasta 8 jugadores en duda se enumeran todos con su probabilidad exacta; con más, se sortean. De la mezcla salen 10,000 marcadores. |
+| N4. Contexto + ML + calibración | ✅ | `app/services/nba_game_model.py` | Descanso, back-to-back, 3 en 4 noches, viaje, zona horaria, altitud, inicio y final de temporada, playoffs. Corrección ridge sobre los errores del estructural. |
+| N5. Backtest | ✅ | `ml/scripts/nba_backtest.py` → [`NBA_BACKTEST.md`](NBA_BACKTEST.md) | Walk-forward 2023-24 a la fecha contra `nba_possessions_v1` y Elo, con ablación. |
+| N6. Producción | ✅ | `app/services/nba_v2.py`, `prediction_engine.py`, front `game-card` | `nba_players_v2` reemplaza a v1 (v1 queda de respaldo si v2 falla, o con `NBA_MODEL=v1`). Se re-simula cuando cambia el reporte de lesiones. El front muestra el bloque **Bajas** con el impacto de cada una. |
+| N7. Extras | ❌ | — | Proyecciones por jugador. |
+
+**Medido y descartado** (no mejoró el backtest; el código queda, apagado):
+- **3d, rendimiento observado sin el jugador:** corregir con lo que el equipo hizo sin él empeora el log loss (0.595 → 0.599–0.616 según el peso). Las muestras sin cada jugador son demasiado chicas y ruidosas.
+- **3b aprendido** (a quién se fueron los minutos en los partidos que faltó): error de minutos 5.7–5.8 contra 5.5 del reparto proporcional.
+- **LightGBM** para el contexto: peor que la ridge (hay pocas variables y la relación es casi lineal).
+- **Ajuste por racha del equipo:** no aporta.
+
+**Decididos por el backtest** (entran solo si bajan el log loss; el script elige solo): la corrección de contexto, el ajuste por uso de los ausentes (3c) y la calibración isotónica. La elección vigente está en [`NBA_BACKTEST.md`](NBA_BACKTEST.md).
+
+**Pendiente:**
+- Calibrar la probabilidad de jugar por estado con el historial de reportes (hace falta juntar semanas de reportes).
+- Descanso de estrellas en back-to-back, aprendido por jugador.
+- Química de quintetos (3e), solo si aporta.
+- Comparación contra el mercado hacia adelante: no hay líneas históricas gratis de NBA.
+- Ritmo según los jugadores disponibles (hoy el ritmo es por equipo).

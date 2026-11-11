@@ -3,17 +3,23 @@ OmniPicks — NBA v2: histórico propio desde nba_api (stats.nba.com, gratis).
 
 - Partidos y box scores por jugador: 2 llamadas por temporada.
 - Stints (tramos con los mismos 10 jugadores): rotaciones + play-by-play, 2 llamadas por partido.
+  El crudo de cada partido se guarda en ml/datasets/nba_raw/ para poder rearmar los
+  stints sin volver a descargar.
 
 Tiempos en décimas de segundo desde el inicio del partido (igual que GameRotation):
 cuarto = 7200, tiempo extra = 3000.
 """
+import gzip
+import json
 import logging
+import os
 import re
 import threading
 import time
 from bisect import bisect_left
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -105,9 +111,63 @@ def fetch_season(season: str, season_type: str):
     return list(games.values()), rows
 
 
+def fetch_player_bio(season: str) -> List[Dict]:
+    """Edad, estatura y peso de cada jugador en la temporada (1 llamada)."""
+    from nba_api.stats.endpoints import leaguedashplayerbiostats
+
+    df = call_nba(leaguedashplayerbiostats.LeagueDashPlayerBioStats, season=season,
+                  season_type_all_star="Regular Season")[0]
+    f = lambda v: None if v is None or v != v or v == "" else float(v)
+    return [{"season": season, "player_id": int(r.PLAYER_ID), "player_name": r.PLAYER_NAME,
+             "age": f(r.AGE), "height_in": f(r.PLAYER_HEIGHT_INCHES), "weight_lb": f(r.PLAYER_WEIGHT)}
+            for r in df.itertuples()]
+
+
 # ══════════════════════════════════════════════════════════════════════
 # Stints (por partido)
 # ══════════════════════════════════════════════════════════════════════
+
+RAW_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "ml", "datasets", "nba_raw"))
+_ROT_COLS = ["TEAM_ID", "PERSON_ID", "IN_TIME_REAL", "OUT_TIME_REAL"]
+_PBP_COLS = ["actionNumber", "period", "clock", "teamId", "personId", "actionType", "subType",
+             "description", "shotValue", "shotResult", "shotDistance", "xLegacy", "yLegacy",
+             "scoreHome", "scoreAway"]
+
+
+def _raw_path(game_id: str) -> str:
+    return os.path.join(RAW_DIR, game_id[:5], f"{game_id}.json.gz")
+
+
+def fetch_game_raw(game_id: str, use_cache: bool = True) -> Dict:
+    """Rotaciones y play-by-play crudos de un partido: {'rot': [...], 'pbp': [...]}.
+
+    Los eventos del play-by-play conservan el orden en que los entrega la NBA, que es
+    el cronológico (actionNumber no lo es: las repeticiones se numeran al final).
+    """
+    path = _raw_path(game_id)
+    if use_cache and os.path.exists(path):
+        try:
+            with gzip.open(path, "rt", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            pass                                    # archivo truncado: se vuelve a descargar
+
+    from nba_api.stats.endpoints import gamerotation, playbyplayv3
+
+    rot_frames = call_nba(gamerotation.GameRotation, game_id=game_id)
+    pbp = call_nba(playbyplayv3.PlayByPlayV3, game_id=game_id)[0]
+    rot = []
+    for df in rot_frames[:2]:
+        rot.extend(json.loads(df[_ROT_COLS].to_json(orient="records")))
+    raw = {"rot": rot, "pbp": json.loads(pbp[[c for c in _PBP_COLS if c in pbp.columns]].to_json(orient="records"))}
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{threading.get_ident()}.tmp"
+    with gzip.open(tmp, "wt", encoding="utf-8") as f:
+        json.dump(raw, f, separators=(",", ":"))
+    os.replace(tmp, path)
+    return raw
+
 
 def _event_time(period: int, clock: str) -> Optional[int]:
     m = _CLOCK_RE.match(clock or "")
@@ -119,20 +179,19 @@ def _event_time(period: int, clock: str) -> Optional[int]:
     return 28800 + (period - 5) * 3000 + 3000 - remaining
 
 
-def build_stints(game_id: str, home_team_id: int) -> List[Dict]:
-    """Tramos del partido con sus 10 jugadores, puntos y posesiones de cada lado."""
-    from nba_api.stats.endpoints import gamerotation, playbyplayv3
+def stints_from_raw(game_id: str, home_team_id: int, raw: Dict) -> Tuple[List[Dict], Dict]:
+    """Arma los tramos de un partido a partir del crudo.
 
-    rot_frames = call_nba(gamerotation.GameRotation, game_id=game_id)
-    pbp = call_nba(playbyplayv3.PlayByPlayV3, game_id=game_id)[0]
-
+    Devuelve (stints, calidad). `calidad` trae los puntos de cada lado según el
+    play-by-play completo y según los stints válidos, y los minutos cubiertos; sirve
+    para detectar partidos con rotaciones corruptas en el origen.
+    """
     # 1. Intervalos en cancha por jugador
-    intervals = []                                  # (in, out, team_id, player_id)
-    for df in rot_frames[:2]:
-        for r in df.itertuples():
-            intervals.append((int(r.IN_TIME_REAL), int(r.OUT_TIME_REAL), int(r.TEAM_ID), int(r.PERSON_ID)))
+    intervals = [(int(r["IN_TIME_REAL"]), int(r["OUT_TIME_REAL"]), int(r["TEAM_ID"]), int(r["PERSON_ID"]))
+                 for r in raw["rot"] if r["IN_TIME_REAL"] is not None and r["OUT_TIME_REAL"] is not None]
+    quality = {"pbp_home": 0, "pbp_away": 0, "stint_home": 0, "stint_away": 0, "minutes": 0.0}
     if not intervals:
-        return []
+        return [], quality
 
     bounds = sorted({t for i in intervals for t in (i[0], i[1])})
     segments = []
@@ -151,46 +210,173 @@ def build_stints(game_id: str, home_team_id: int) -> List[Dict]:
         idx = bisect_left(bounds, t) - 1
         return segments[max(0, min(idx, len(segments) - 1))]
 
-    # 2. Puntos y posesiones desde el play-by-play
-    prev_home = prev_away = 0
+    # 2. Puntos y posesiones desde el play-by-play, en orden cronológico.
+    #    Los puntos salen de cada evento (canasta o tiro libre anotado), no de la
+    #    diferencia de marcador: el marcador del PBP trae retrocesos y erratas.
+    events = []
+    for n, e in enumerate(raw["pbp"]):
+        t = _event_time(int(e["period"]), e.get("clock"))
+        if t is not None:
+            events.append((t, n, e))
+    events.sort(key=lambda x: (x[0], x[1]))
+
     last_miss_team = None
-    for e in pbp.sort_values("actionNumber").itertuples():
-        t = _event_time(int(e.period), e.clock)
-        if t is None:
-            continue
+    last_miss_seg = None
+    for t, _, e in events:
         seg = seg_for(t)
-        team = int(e.teamId) if e.teamId == e.teamId and e.teamId else 0
-        side = "home" if team == home_team_id else "away"
-        desc = e.description or ""
+        action = e.get("actionType") or ""
+        sub = e.get("subType") or ""
+        desc = e.get("description") or ""
 
-        if e.scoreHome not in ("", None) and e.scoreAway not in ("", None):
-            sh, sa = int(e.scoreHome), int(e.scoreAway)
-            seg["home_pts"] += max(0, sh - prev_home)
-            seg["away_pts"] += max(0, sa - prev_away)
-            prev_home, prev_away = sh, sa
+        if action == "period":
+            # Fin de periodo con un tiro fallado sin rebote: esa posesión también terminó
+            if sub == "end" and last_miss_team:
+                side = "home" if last_miss_team == home_team_id else "away"
+                (last_miss_seg or seg)[f"{side}_poss"] += 1
+            last_miss_team = last_miss_seg = None
+            continue
 
+        team = int(e["teamId"]) if e.get("teamId") else 0
         if not team:
             continue
-        if e.actionType == "Made Shot":
+        side = "home" if team == home_team_id else "away"
+
+        if action == "Made Shot":
+            seg[f"{side}_pts"] += int(e.get("shotValue") or 2)
             seg[f"{side}_poss"] += 1
-        elif e.actionType == "Turnover":
+            last_miss_team = last_miss_seg = None
+        elif action == "Turnover":
             seg[f"{side}_poss"] += 1
-        elif e.actionType == "Missed Shot":
-            last_miss_team = team
-        elif e.actionType == "Free Throw":
+            last_miss_team = last_miss_seg = None
+        elif action == "Missed Shot":
+            last_miss_team, last_miss_seg = team, seg
+        elif action == "Free Throw":
+            final = bool(_FINAL_FT_RE.search(sub))
             if desc.startswith("MISS"):
-                last_miss_team = team
-            elif _FINAL_FT_RE.search(e.subType or "") and "1 of 1" not in (e.subType or ""):
-                seg[f"{side}_poss"] += 1
-        elif e.actionType == "Rebound":
+                if final:
+                    last_miss_team, last_miss_seg = team, seg
+            else:
+                seg[f"{side}_pts"] += 1
+                if final and "1 of 1" not in sub:
+                    seg[f"{side}_poss"] += 1
+                    last_miss_team = last_miss_seg = None
+        elif action == "Rebound":
             if last_miss_team and team != last_miss_team:       # rebote defensivo: termina la posesión rival
                 other = "home" if last_miss_team == home_team_id else "away"
                 seg[f"{other}_poss"] += 1
-            last_miss_team = None
+            last_miss_team = last_miss_seg = None
 
     out = []
     for s in segments:
         valid = s.pop("_valid")
-        if valid and (s["home_poss"] or s["away_poss"] or s["home_pts"] or s["away_pts"]):
+        quality["pbp_home"] += s["home_pts"]
+        quality["pbp_away"] += s["away_pts"]
+        if not valid:
+            continue
+        quality["stint_home"] += s["home_pts"]
+        quality["stint_away"] += s["away_pts"]
+        quality["minutes"] += (s["end_t"] - s["start_t"]) / 600.0
+        if s["home_poss"] or s["away_poss"] or s["home_pts"] or s["away_pts"]:
             out.append(s)
-    return out
+    return out, quality
+
+
+def build_stints(game_id: str, home_team_id: int, use_cache: bool = True) -> List[Dict]:
+    """Tramos del partido con sus 10 jugadores, puntos y posesiones de cada lado."""
+    return stints_from_raw(game_id, home_team_id, fetch_game_raw(game_id, use_cache))[0]
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Carga a la base (la usan el backfill y la actualización diaria)
+# ══════════════════════════════════════════════════════════════════════
+
+def current_seasons(first_year: Optional[int] = None) -> List[str]:
+    last = int(season_of(date.today())[:4])
+    first = last if first_year is None else first_year
+    return [f"{y}-{(y + 1) % 100:02d}" for y in range(first, last + 1)]
+
+
+def _chunks(rows, n=1000):
+    for i in range(0, len(rows), n):
+        yield rows[i:i + n]
+
+
+def load_season(engine, season: str) -> int:
+    """Inserta o actualiza los partidos y box scores de una temporada. Devuelve partidos vistos."""
+    from sqlalchemy.dialects.mysql import insert as mysql_insert
+    from app.db_models import NBAGame, NBAPlayerGame, NBAPlayerSeason
+
+    try:
+        bio = fetch_player_bio(season)
+        with engine.begin() as conn:
+            for part in _chunks(bio):
+                stmt = mysql_insert(NBAPlayerSeason).values(part)
+                conn.execute(stmt.on_duplicate_key_update(
+                    age=stmt.inserted.age, height_in=stmt.inserted.height_in, weight_lb=stmt.inserted.weight_lb))
+    except Exception as e:                          # la ficha es secundaria: no detiene la carga
+        logger.warning(f"{season}: no se pudo leer la ficha de jugadores ({type(e).__name__}: {e})")
+
+    total = 0
+    for season_type in SEASON_TYPES:
+        games, player_games = fetch_season(season, season_type)
+        if not games:
+            logger.info(f"{season} {season_type}: sin partidos")
+            continue
+        with engine.begin() as conn:
+            for part in _chunks(games):
+                stmt = mysql_insert(NBAGame).values(part)
+                conn.execute(stmt.on_duplicate_key_update(
+                    home_pts=stmt.inserted.home_pts, away_pts=stmt.inserted.away_pts))
+            for part in _chunks(player_games):
+                conn.execute(mysql_insert(NBAPlayerGame).values(part).prefix_with("IGNORE"))
+        total += len(games)
+        logger.info(f"{season} {season_type}: {len(games)} partidos, {len(player_games)} filas de jugador")
+    return total
+
+
+def load_stints(engine, seasons: List[str], workers: int = 3) -> Tuple[int, int]:
+    """Arma y guarda los stints de los partidos pendientes. Devuelve (hechos, fallidos)."""
+    from sqlalchemy import bindparam, text
+    from app.db_models import NBAStint
+
+    with engine.connect() as conn:
+        pending = conn.execute(text(
+            "SELECT game_id, home_team_id, home_pts, away_pts FROM nba_games "
+            "WHERE stints_done = 0 AND home_pts IS NOT NULL AND season IN :s ORDER BY game_date"
+        ).bindparams(bindparam("s", expanding=True)), {"s": seasons}).fetchall()
+
+    total = len(pending)
+    logger.info(f"Stints pendientes: {total} partidos")
+    done = failed = suspect = 0
+    start = time.time()
+
+    def work(row):
+        return stints_from_raw(row.game_id, row.home_team_id, fetch_game_raw(row.game_id))
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(work, r): r for r in pending}
+        for fut in as_completed(futures):
+            row = futures[fut]
+            try:
+                stints, q = fut.result()
+                with engine.begin() as conn:
+                    conn.execute(text("DELETE FROM nba_stints WHERE game_id = :g"), {"g": row.game_id})
+                    if stints:
+                        conn.execute(NBAStint.__table__.insert(), stints)
+                    conn.execute(text("UPDATE nba_games SET stints_done = 1 WHERE game_id = :g"), {"g": row.game_id})
+                done += 1
+                lost = abs(q["stint_home"] - row.home_pts) + abs(q["stint_away"] - row.away_pts)
+                if lost > 6:
+                    suspect += 1
+                    logger.warning(
+                        f"Partido {row.game_id}: stints {q['stint_home']}-{q['stint_away']} en {q['minutes']:.0f} min "
+                        f"contra marcador {row.home_pts}-{row.away_pts} (PBP {q['pbp_home']}-{q['pbp_away']})")
+            except Exception as e:
+                failed += 1
+                logger.warning(f"Partido {row.game_id} falló ({type(e).__name__}: {str(e)[:80]}); se reintenta en la próxima corrida")
+            n = done + failed
+            if n % 50 == 0 or n == total:
+                rate = n / max(time.time() - start, 1)
+                eta = (total - n) / max(rate, 0.01) / 60
+                logger.info(f"Stints {n}/{total} (ok {done}, fallidos {failed}, incompletos {suspect}) · faltan ~{eta:.0f} min")
+    return done, failed

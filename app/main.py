@@ -19,6 +19,7 @@ from app.api.routes_predictions import router as predictions_router
 from app.api.routes_odds import router as odds_router
 from app.api.routes_sports import router as sports_router
 from app.api.routes_bankroll import router as bankroll_router
+from app.services.nba_scheduler import start_nba_scheduler, stop_nba_scheduler
 
 
 # ── Configure Logging ─────────────────────────────────────────────────
@@ -63,18 +64,28 @@ async def lifespan(app: FastAPI):
 
     logger.info("🏆 OmniPicks is ready!")
 
-    # Ejecutar pipeline automáticamente en segundo plano al arrancar
-    logger.info("⏳ Lanzando el pipeline de extracción de datos en segundo plano...")
-    asyncio.create_task(run_daily_pipeline())
-    
-    # Lanzar la sincronización histórica (Similar-Opponent)
-    logger.info("⏳ Lanzando la sincronización histórica de perfiles (Cron V3)...")
-    asyncio.create_task(run_cron())
+    if settings.run_pipeline_on_startup:
+        # Ejecutar pipeline automáticamente en segundo plano al arrancar
+        logger.info("⏳ Lanzando el pipeline de extracción de datos en segundo plano...")
+        asyncio.create_task(run_daily_pipeline())
+
+        # Lanzar la sincronización histórica (Similar-Opponent)
+        logger.info("⏳ Lanzando la sincronización histórica de perfiles (Cron V3)...")
+        asyncio.create_task(run_cron())
+    else:
+        logger.info("⏸️  Pipeline al arrancar desactivado (RUN_PIPELINE_ON_STARTUP=false)")
+
+    # NBA v2: lesiones cada 30 min e histórico diario (gratis, sin cuota)
+    try:
+        start_nba_scheduler()
+    except Exception as e:
+        logger.warning(f"⚠️  No se pudieron programar las tareas NBA: {e}")
 
     yield
 
     # Shutdown
     logger.info("🔌 Shutting down OmniPicks...")
+    stop_nba_scheduler()
     await close_db()
     logger.info("👋 Goodbye!")
 

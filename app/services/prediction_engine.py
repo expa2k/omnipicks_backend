@@ -2,7 +2,9 @@
 OmniPicks — Prediction Engine Orchestrator
 Coordinates feature engineering, models, and value calculation.
 """
+import asyncio
 import logging
+import os
 from datetime import date
 from typing import List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -46,6 +48,21 @@ class PredictionEngine:
             picks_delete = picks_delete.where(Pick.sport.in_(sports))
         await self.db.execute(picks_delete)
         await self.db.flush()
+
+        # NBA v2 (modelo de jugadores): se calcula todo el día de una vez; si falla, queda v1
+        nba_v2 = {}
+        nba_games = [g for g in games if g.sport == SportType.NBA]
+        if nba_games and os.getenv("NBA_MODEL", "v2").lower() != "v1":
+            from app.services.nba_v2 import predict_games_sync
+            try:
+                nba_v2 = await asyncio.to_thread(
+                    predict_games_sync, target_date, [(g.id, g.home_team_name, g.away_team_name) for g in nba_games])
+                logger.info(f"NBA v2: {len(nba_v2)}/{len(nba_games)} partidos")
+            except Exception as e:
+                logger.warning(f"NBA v2 no disponible ({type(e).__name__}: {e}); se usa nba_possessions_v1")
+            # Una predicción vigente por partido: se reemplazan las anteriores de NBA
+            await self.db.execute(delete(Prediction).where(Prediction.game_id.in_([g.id for g in nba_games])))
+            await self.db.flush()
         
         for game in games:
             game_date_str = game.game_date.isoformat() if game.game_date else None
@@ -96,6 +113,9 @@ class PredictionEngine:
                     # Fallback to pure organic simulation if Bzzoiro fails
                     pred_result = sim_result
                     model_name = "monte_carlo_soccer_v2"
+            elif game.sport == SportType.NBA and game.id in nba_v2:
+                pred_result = nba_v2[game.id]
+                model_name = pred_result["simulation_details"]["model"]
             else:
                 # 1. Run Models & Simulations for US Sports
                 pred_result = self.simulation_engine.simulate(game.sport, features)
