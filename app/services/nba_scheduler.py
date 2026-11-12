@@ -4,7 +4,8 @@ OmniPicks — NBA v2: tareas programadas (todas gratis, sin cuota).
 - Al arrancar (pensado para prender la PC solo cuando se quiere): se pone al día con lo
   que pasó mientras estuvo apagada (box scores, stints y ratings), carga los partidos NBA
   de hoy y mañana desde ESPN y los predice. Nada de esto gasta cuota de pago.
-- Lesiones (reporte oficial de la NBA y ESPN): cada 30 minutos; si alguno cambió, se vuelven a predecir los
+- Lesiones (reporte oficial de la NBA y ESPN): cada 10 minutos en la hora y media antes de
+  algún partido y cada 30 el resto del día; si alguno cambió, se vuelven a predecir los
   partidos NBA de hoy y mañana. En cada vuelta también revisa si los ratings son de un
   día anterior (p. ej. la PC estaba dormida a las 04:30) y, si es así, se pone al día.
 - Histórico: una vez al día a las 04:30 ET, lo mismo que al arrancar.
@@ -184,6 +185,7 @@ async def job_update_history(rerun: bool = True):
 
 
 async def job_startup():
+    global _last_injury_check
     """Al arrancar: ponerse al día si hace falta; si ya estaba al día, al menos cargar y predecir hoy."""
     try:
         if not await catch_up("arranque"):
@@ -191,6 +193,42 @@ async def job_startup():
                 await rerun_nba_predictions("arranque")
     except Exception as e:
         logger.warning(f"NBA: falló la puesta al día del arranque ({type(e).__name__}: {e})")
+    _last_injury_check = datetime.utcnow()
+    await job_sync_injuries()
+
+
+# Revisión de lesiones: cada 10 min en la hora y media antes de algún partido, cada 30 el resto
+NEAR_TIP_MINUTES = 90
+NEAR_INTERVAL = 10
+FAR_INTERVAL = 30
+_last_injury_check: Optional[datetime] = None
+
+
+def _minutes_to_next_tip() -> Optional[float]:
+    """Minutos hasta el próximo partido NBA programado (hora UTC de la base)."""
+    from sqlalchemy import create_engine, text
+    engine = create_engine(get_settings().mysql_url_sync, pool_pre_ping=True)
+    try:
+        with engine.connect() as conn:
+            nxt = conn.execute(text(
+                "SELECT MIN(game_time) FROM games WHERE sport = 'NBA' AND status = 'SCHEDULED' AND game_time > UTC_TIMESTAMP()")).scalar()
+        return None if nxt is None else (nxt - datetime.utcnow()).total_seconds() / 60.0
+    finally:
+        engine.dispose()
+
+
+async def job_injury_tick():
+    """Cada 5 min decide si toca revisar: más seguido cerca del inicio de un partido."""
+    global _last_injury_check
+    now = datetime.utcnow()
+    try:
+        to_tip = await asyncio.to_thread(_minutes_to_next_tip)
+    except Exception:
+        to_tip = None
+    every = NEAR_INTERVAL if (to_tip is not None and to_tip <= NEAR_TIP_MINUTES) else FAR_INTERVAL
+    if _last_injury_check is not None and (now - _last_injury_check).total_seconds() < every * 60 - 30:
+        return
+    _last_injury_check = now
     await job_sync_injuries()
 
 
@@ -200,11 +238,11 @@ def start_nba_scheduler() -> Optional[AsyncIOScheduler]:
         return _scheduler
     _scheduler = AsyncIOScheduler(timezone=TIMEZONE)
     common = dict(max_instances=1, coalesce=True, misfire_grace_time=600)
-    _scheduler.add_job(job_sync_injuries, IntervalTrigger(minutes=30), id="nba_injuries", **common)
+    _scheduler.add_job(job_injury_tick, IntervalTrigger(minutes=5), id="nba_injuries", **common)
     _scheduler.add_job(job_update_history, CronTrigger(hour=4, minute=30), id="nba_history", **common)
     _scheduler.start()
     asyncio.get_running_loop().create_task(job_startup())            # ponerse al día al arrancar
-    logger.info("🏀 Tareas NBA programadas: lesiones cada 30 min, histórico diario 04:30 ET")
+    logger.info("🏀 Tareas NBA programadas: lesiones cada 10 min cerca de los partidos (30 min el resto), histórico diario 04:30 ET")
     return _scheduler
 
 
