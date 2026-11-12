@@ -275,6 +275,21 @@ En la app, "Por qué este pronóstico" muestra el estado de cada QB y notas como
 - Ahora van una por una (`_predict_lock` en el scheduler).
 - Si el registro falla por un error de base de datos, la corrida se aborta en vez de seguir a medias.
 
+### Clima: lluvia y pronóstico de ESPN
+
+- **Histórico:** las jugadas de nflverse traen el clima observado en texto ("Light Snow Temp: 36° F…"). `game_weather()` marca lluvia o nieve al aire libre: 240 partidos con lluvia y 45 con nieve desde 2010.
+- **Efecto** (out-of-sample, 2013–2026):
+  - La **lluvia resta ~3.4 puntos** del total. En los 189 partidos con lluvia, el error baja de **10.93 a 10.44**; el mercado está en 10.36. En esos partidos la línea también se queda alta: 43.5 contra 40.9 real.
+  - La **nieve** (39 partidos) empeoraba el error (13.9), así que no entra.
+- **Partidos por jugar:** el resumen del partido de ESPN (`/summary?event=…`, AccuWeather) da la probabilidad de lluvia, las ráfagas y la temperatura.
+  - La probabilidad de lluvia entra como "lluvia esperada": 64% → −2.2 pts.
+  - Las ráfagas × 0.7 se usan como viento si nflverse todavía no lo tiene.
+  - No aplica bajo techo.
+- **Ejemplo (12-nov, WAS @ NYG):** con 64% de lluvia, el total del modelo bajó de 46.1 a 44.2 (línea 40.5).
+- **Front:**
+  - Nota "64% de probabilidad de lluvia (pronóstico ESPN): el total baja ~2.2 pts".
+  - En la NFL, las fichas Ganador/Spread/Total dicen "Se inclina por", en gris y con borde punteado: no son recomendaciones.
+
 ### Rendimiento en vivo en la app
 
 - `GET /api/predictions/nfl/performance`: mismo formato que el de la NBA (`performance(db, days, sport="nfl")`):
@@ -288,3 +303,4 @@ En la app, "Por qué este pronóstico" muestra el estado de cada QB y notas como
 **Pendiente:**
 - Guardar las líneas de apertura para medir si hay ventaja antes de que la línea se mueva.
 - Bajas por grupo de posición (además del QB).
+- Semanas 17–18: equipos ya clasificados o eliminados.

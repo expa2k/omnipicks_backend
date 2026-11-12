@@ -22,6 +22,7 @@ PBP_COLUMNS = [
     "play_type", "pass", "rush", "qb_dropback", "epa", "success", "wp", "down", "half_seconds_remaining",
     "passer_player_id", "passer_player_name", "cpoe", "qb_epa",
     "id", "name", "qb_scramble", "sack",      # id/name: el QB del dropback (también en scrambles y sacks)
+    "weather", "roof",                        # clima observado ("Light Snow Temp: 36° F…") y techo
 ]
 
 
@@ -46,7 +47,7 @@ def load_pbp(seasons: Iterable[int], refresh_current: bool = False) -> pl.DataFr
         path = _pbp_path(season)
         if os.path.exists(path) and not (refresh_current and season == cur):
             cached = pl.read_parquet(path)
-            if all(c in cached.columns for c in ("id", "name")):     # caché con las columnas de hoy
+            if all(c in cached.columns for c in ("id", "name", "weather")):     # caché con las columnas de hoy
                 frames.append(cached)
                 continue
         logger.info(f"NFL: descargando jugadas de {season}")
@@ -99,3 +100,18 @@ def team_games(pbp: pl.DataFrame, wp_lo: float = 0.05, wp_hi: float = 0.95) -> p
         epa=pl.col("epa_pass") + pl.col("epa_rush"),
     )
     return wide.sort(["game_date", "game_id", "posteam"])
+
+
+RAIN_WORDS = ("rain", "shower", "drizzle", "thunder", "storm")
+SNOW_WORDS = ("snow", "flurr", "sleet", "ice", "freezing")
+
+
+def game_weather(pbp: pl.DataFrame) -> pl.DataFrame:
+    """Un renglón por partido: si llovió o nevó (al aire libre), según el clima observado de nflverse."""
+    g = pbp.group_by("game_id").agg(weather=pl.col("weather").drop_nulls().first(), roof=pl.col("roof").first())
+    w = pl.col("weather").fill_null("").str.to_lowercase()
+    outdoor = ~pl.col("roof").is_in(["dome", "closed"])
+    # "Snow" va primero: "rain and snow" cuenta como nieve
+    snow = w.str.contains("|".join(SNOW_WORDS)) & outdoor
+    rain = w.str.contains("|".join(RAIN_WORDS)) & outdoor & ~snow
+    return g.select("game_id", rain=rain.cast(pl.Float64), snow=snow.cast(pl.Float64))

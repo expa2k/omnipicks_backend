@@ -23,7 +23,8 @@ import polars as pl
 from scipy.optimize import minimize_scalar
 from scipy.stats import norm
 
-from app.services.nfl_history import current_season, load_pbp, load_schedules, normalize_teams, team_games
+from app.services.nfl_history import (current_season, game_weather, load_pbp, load_schedules, normalize_teams,
+                                      team_games)
 from app.services.nfl_qb import QBParams, QBRatingEngine, qb_games, qb_margin_features
 from app.services.nfl_ratings import (NFLRatingEngine, PointsRatingEngine, RatingParams, ScoringRatingEngine,
                                       expected_margin_epa)
@@ -62,7 +63,9 @@ def abbr(name: str) -> str:
 # ══════════════════════════════════════════════════════════════════════
 
 MARGIN_FEATURES = ["epa", "points", "qb_adj", "qb_raw"]
-TOTAL_FEATURES = ["scoring", "epa_total", "pace", "indoor", "wind", "cold"]
+# Lluvia: en el histórico resta ~3.4 pts y en esos partidos el error baja de 10.9 a 10.4.
+# La nieve (39 partidos) empeoraba el error, así que no entra.
+TOTAL_FEATURES = ["scoring", "epa_total", "pace", "indoor", "wind", "cold", "rain"]
 
 
 class Features:
@@ -77,6 +80,8 @@ class Features:
         self.score = ScoringRatingEngine(played, SCORE_P)
         self.qb = QBRatingEngine(qbg, QB_P)
         self.qb_names = dict(zip(qbg["id"].to_list(), qbg["name"].to_list()))
+        wx = game_weather(pbp)
+        self.wx = {g: (r, s) for g, r, s in zip(wx["game_id"].to_list(), wx["rain"].to_list(), wx["snow"].to_list())}
         self._cache: Dict[Tuple[int, int], Tuple] = {}
         self._pace = self._pace_snapshots(pbp, sched)
 
@@ -116,10 +121,19 @@ class Features:
         indoor = r.get("roof") in ("dome", "closed")
         wind = 0.0 if indoor or r.get("wind") is None else float(r["wind"])
         temp = 65.0 if indoor or r.get("temp") is None else float(r["temp"])
+        # Lluvia y nieve: la observada (histórico) o la probabilidad del pronóstico (partidos por jugar)
+        rain, snow = self.wx.get(r.get("game_id"), (0.0, 0.0))
+        if r.get("rain") is not None:
+            rain = float(r["rain"])
+        if r.get("snow") is not None:
+            snow = float(r["snow"])
+        if indoor:
+            rain = snow = 0.0
         t = {"scoring": 2 * mu_s + (0.0 if neutral else h_s) + off_s.get(home, 0) - def_s.get(away, 0)
                         + off_s.get(away, 0) - def_s.get(home, 0),
              "epa_total": x_te, "pace": pace.get(home, lg) + pace.get(away, lg) - 2 * lg,
-             "indoor": 1.0 if indoor else 0.0, "wind": max(0.0, wind - 10.0), "cold": max(0.0, 40.0 - temp)}
+             "indoor": 1.0 if indoor else 0.0, "wind": max(0.0, wind - 10.0), "cold": max(0.0, 40.0 - temp),
+             "rain": rain, "snow": snow}
         info = {
             "home_net_epa": round(we.net(home), 3), "away_net_epa": round(we.net(away), 3),
             "home_points_rating": round(st.get(home, 0.0), 1), "away_points_rating": round(st.get(away, 0.0), 1),
@@ -127,6 +141,7 @@ class Features:
             "home_qb": self._qb_info(wq, home, r.get("home_qb_id"), r.get("home_qb_name")),
             "away_qb": self._qb_info(wq, away, r.get("away_qb_id"), r.get("away_qb_name")),
             "indoor": indoor, "wind": r.get("wind"), "temp": r.get("temp"),
+            "rain": round(rain, 2), "snow": round(snow, 2), "weather_source": r.get("weather_source"),
         }
         return m, t, info
 
@@ -310,6 +325,24 @@ def _match(sched: pl.DataFrame, home: str, away: str, day: date) -> Optional[Dic
     return None if best is None else best[1]
 
 
+def espn_forecast(event_id: Optional[str]) -> Optional[Dict]:
+    """Pronóstico del clima de ESPN para un partido por jugar (AccuWeather): probabilidad de lluvia,
+    ráfagas y temperatura. None si ESPN no lo tiene."""
+    if not event_id:
+        return None
+    from app.services.nfl_qb_status import _get
+    d = _get("https://site.api.espn.com/apis/site/v2/sports/football/nfl/summary", event=str(event_id)) or {}
+    w = (d.get("gameInfo") or {}).get("weather")
+    if not w:
+        return None
+    cond = int(w.get("conditionId") or 0)
+    snowy = 19 <= cond <= 29 and cond != 26           # códigos de AccuWeather: nieve, aguanieve, hielo
+    precip = float(w.get("precipitation") or 0) / 100.0
+    return {"rain": 0.0 if snowy else precip, "snow": precip if snowy else 0.0,
+            "temp": w.get("temperature"), "wind": None if w.get("gust") is None else round(0.7 * float(w["gust"]), 1),
+            "precipitation_pct": w.get("precipitation"), "condition_id": cond}
+
+
 def _row_with_lineups(feats: Features, r: Dict, qbs, home: str, away: str):
     """Variables del partido con el QB de cada equipo según ESPN: si el titular está en duda, las
     del QB se promedian entre él y su suplente con la probabilidad de que juegue."""
@@ -342,8 +375,8 @@ def _row_with_lineups(feats: Features, r: Dict, qbs, home: str, away: str):
     return dict(m_avg), t, info
 
 
-def predict_games_sync(games: List[Tuple[int, str, str, date]], refresh: bool = False) -> Dict[int, Dict]:
-    """[(id, local, visita, fecha ET)] → {id: resultado}. Entrena si los parámetros tienen más de 20 h."""
+def predict_games_sync(games: List[Tuple], refresh: bool = False) -> Dict[int, Dict]:
+    """[(id, local, visita, fecha ET[, id de ESPN])] → {id: resultado}. Entrena si los parámetros tienen más de 20 h."""
     p = load_params()
     if params_are_stale(p):
         p = train(refresh=True)
@@ -362,12 +395,26 @@ def predict_games_sync(games: List[Tuple[int, str, str, date]], refresh: bool = 
         logger.warning(f"NFL v2: sin lesiones de ESPN, se usa el titular de nflverse ({type(e).__name__}: {e})")
         qbs = None
     out = {}
-    for gid, home, away, day in games:
+    for g in games:
+        gid, home, away, day = g[:4]
+        event_id = g[4] if len(g) > 4 else None
         r = _match(sched, home, away, day)
         if r is None:
             logger.warning(f"NFL v2: {away} @ {home} ({day}) no está en el calendario de nflverse")
             continue
+        if r.get("result") is None and r.get("roof") not in ("dome", "closed"):
+            try:
+                fc = espn_forecast(event_id)
+            except Exception as e:
+                logger.warning(f"NFL v2: sin pronóstico del clima para {away} @ {home} ({type(e).__name__}: {e})")
+                fc = None
+            if fc:
+                r = {**r, "rain": fc["rain"], "snow": fc["snow"], "weather_source": "pronóstico ESPN",
+                     "precipitation_pct": fc["precipitation_pct"],
+                     "temp": r.get("temp") if r.get("temp") is not None else fc["temp"],
+                     "wind": r.get("wind") if r.get("wind") is not None else fc["wind"]}
         m, t, info = _row_with_lineups(feats, r, qbs, home, away)
+        info["precipitation_pct"] = r.get("precipitation_pct")
         mu = float(p["margin_coef"][0] + sum(c * m[k] for c, k in zip(p["margin_coef"][1:], MARGIN_FEATURES)))
         tot = float(p["total_coef"][0] + sum(c * t[k] for c, k in zip(p["total_coef"][1:], TOTAL_FEATURES)))
         pr = dist.probs(mu)

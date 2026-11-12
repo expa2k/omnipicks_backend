@@ -83,7 +83,7 @@ class PredictionEngine:
             from app.services.nfl_v2 import predict_games_sync as nfl_predict
             try:
                 nfl_v2 = await asyncio.to_thread(
-                    nfl_predict, [(g.id, g.home_team_name, g.away_team_name, g.game_date) for g in nfl_games])
+                    nfl_predict, [(g.id, g.home_team_name, g.away_team_name, g.game_date, g.external_id) for g in nfl_games])
                 logger.info(f"NFL v2: {len(nfl_v2)}/{len(nfl_games)} partidos")
             except Exception as e:
                 logger.warning(f"NFL v2 no disponible ({type(e).__name__}: {e}); se usa monte_carlo_v1")
