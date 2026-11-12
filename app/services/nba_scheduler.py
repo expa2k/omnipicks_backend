@@ -231,14 +231,15 @@ FAR_INTERVAL = 30
 _last_injury_check: Optional[datetime] = None
 
 
-def _minutes_to_next_tip() -> Optional[float]:
-    """Minutos hasta el próximo partido NBA programado (hora UTC de la base)."""
+def _minutes_to_next_tip(sport: str = "NBA") -> Optional[float]:
+    """Minutos hasta el próximo partido programado de ese deporte (hora UTC de la base)."""
     from sqlalchemy import create_engine, text
     engine = create_engine(get_settings().mysql_url_sync, pool_pre_ping=True)
     try:
         with engine.connect() as conn:
             nxt = conn.execute(text(
-                "SELECT MIN(game_time) FROM games WHERE sport = 'NBA' AND status = 'SCHEDULED' AND game_time > UTC_TIMESTAMP()")).scalar()
+                "SELECT MIN(game_time) FROM games WHERE sport = :s AND status = 'SCHEDULED' AND game_time > UTC_TIMESTAMP()"),
+                {"s": sport}).scalar()
         return None if nxt is None else (nxt - datetime.utcnow()).total_seconds() / 60.0
     finally:
         engine.dispose()
@@ -259,6 +260,34 @@ async def job_injury_tick():
     await job_sync_injuries()
 
 
+# NFL: los inactivos oficiales salen 90 min antes del partido. Cada 10 min en las 2 horas previas a
+# algún partido; cada hora el resto del tiempo.
+NFL_NEAR_MINUTES = 120
+NFL_NEAR_INTERVAL = 10
+NFL_FAR_INTERVAL = 60
+_last_nfl_check: Optional[datetime] = None
+
+
+async def job_nfl_tick():
+    global _last_nfl_check
+    now = datetime.utcnow()
+    try:
+        to_kick = await asyncio.to_thread(_minutes_to_next_tip, "NFL")
+    except Exception:
+        to_kick = None
+    every = NFL_NEAR_INTERVAL if (to_kick is not None and to_kick <= NFL_NEAR_MINUTES) else NFL_FAR_INTERVAL
+    if _last_nfl_check is not None and (now - _last_nfl_check).total_seconds() < every * 60 - 30:
+        return
+    _last_nfl_check = now
+    await job_nfl()
+
+
+async def _nfl_startup():
+    global _last_nfl_check
+    _last_nfl_check = datetime.utcnow()
+    await job_nfl()
+
+
 def start_nba_scheduler() -> Optional[AsyncIOScheduler]:
     global _scheduler
     if _scheduler or not get_settings().nba_scheduler_enabled:
@@ -267,11 +296,11 @@ def start_nba_scheduler() -> Optional[AsyncIOScheduler]:
     common = dict(max_instances=1, coalesce=True, misfire_grace_time=600)
     _scheduler.add_job(job_injury_tick, IntervalTrigger(minutes=5), id="nba_injuries", **common)
     _scheduler.add_job(job_update_history, CronTrigger(hour=4, minute=30), id="nba_history", **common)
-    _scheduler.add_job(job_nfl, IntervalTrigger(minutes=60), id="nfl", **common)
+    _scheduler.add_job(job_nfl_tick, IntervalTrigger(minutes=5), id="nfl", **common)
     _scheduler.start()
     asyncio.get_running_loop().create_task(job_startup())            # ponerse al día al arrancar
-    asyncio.get_running_loop().create_task(job_nfl())
-    logger.info("🏀 Tareas NBA programadas: lesiones cada 10 min cerca de los partidos (30 min el resto), histórico diario 04:30 ET; NFL cada hora")
+    asyncio.get_running_loop().create_task(_nfl_startup())
+    logger.info("🏀 Tareas NBA programadas: lesiones cada 10 min cerca de los partidos (30 min el resto), histórico diario 04:30 ET; NFL cada 10 min en las 2 h previas a un partido (cada hora el resto)")
     return _scheduler
 
 
