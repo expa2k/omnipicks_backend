@@ -175,6 +175,126 @@ def _calib_k(z: np.ndarray, y: np.ndarray, w: Optional[np.ndarray] = None) -> fl
     return float(minimize_scalar(nll, bounds=(0.0, 1.5), method="bounded").x)
 
 
+# ══════════════════════════════════════════════════════════════════════
+# Bajas por jugador (v3, fases 1 y 3): RAPM + probabilidad de jugar de todas las posiciones
+# ══════════════════════════════════════════════════════════════════════
+
+PLAYS_PER_GAME = 62.0
+INJURY_QUANTILE = 70          # el ajuste por bajas se aplica cuando la diferencia está en el 30% más alto
+
+
+def _train_players(pbp, played: pl.DataFrame, mu: np.ndarray, y: np.ndarray) -> Optional[Dict]:
+    """Ajuste por bajas: margen = a + b·v2 + c·fuerza por jugadores + d·bajas previstas, con las
+    temporadas que tienen participación (2018–). Se aplica solo si la diferencia de bajas es grande."""
+    from app.services.nfl_players import (RapmParams, expected_usage, fit_rapm, injury_adjustment, learn_availability,
+                                          load_injury_reports, load_participation, play_table, replacement_levels,
+                                          team_strength, usage_from_plays, values_to_dict)
+    cur = current_season()
+    prm = RapmParams(season_half_life=2.0, ridge={"QB": 50, "default": 800})
+    plays = play_table(pbp, load_participation(range(2016, cur)))
+    if plays.height == 0:
+        return None
+    use = usage_from_plays(plays)
+    exp = expected_usage(use)
+    inj = load_injury_reports(range(2016, cur))
+    table = learn_availability(inj, use, exp)
+    report = {}
+    for r in inj.iter_rows(named=True):
+        report.setdefault((r["season"], r["week"], r["team"]), {})[r["gsis_id"]] = (r["report_status"], r["practice_status"])
+    seasons = sorted(set(plays["season"].unique().to_list()))
+    values = {s: fit_rapm(plays, s, prm) for s in seasons if s >= 2018}
+    repl = {s: replacement_levels(v) for s, v in values.items()}
+    X, Y, XI = [], [], []
+    for i, r in enumerate(played.iter_rows(named=True)):
+        s = r["season"]
+        if s not in values or np.isnan(mu[i]):
+            continue
+        eh, ea = exp.get((s, r["week"], r["home_team"])), exp.get((s, r["week"], r["away_team"]))
+        if not (eh and ea and eh["o"] and ea["o"]):
+            continue
+        v, rp = values[s], repl[s]
+        oh, dh = team_strength(v, eh); oa, da = team_strength(v, ea)
+        lh, _ = injury_adjustment(v, eh, report.get((s, r["week"], r["home_team"]), {}), table, rp)
+        la, _ = injury_adjustment(v, ea, report.get((s, r["week"], r["away_team"]), {}), table, rp)
+        xi = (lh - la) * PLAYS_PER_GAME
+        X.append([mu[i], ((oh + dh) - (oa + da)) * PLAYS_PER_GAME, xi]); Y.append(y[i]); XI.append(xi)
+    if len(Y) < 500:
+        return None
+    X, Y = np.array(X), np.array(Y)
+    coef = _fit(X, Y)
+    now = fit_rapm(plays, cur, prm)
+    return {"stack_coef": coef.tolist(), "threshold": float(np.percentile(np.abs(XI), INJURY_QUANTILE)),
+            "availability": table, "games": int(len(Y)), "values": values_to_dict(now),
+            "repl": {f"{k[0]}|{k[1]}": v for k, v in replacement_levels(now).items()}}
+
+
+class PlayersNow:
+    """Lo que hace falta para el ajuste por bajas en la semana actual: uso esperado por snaps, reporte
+    de lesiones (nflverse + ESPN) y los valores RAPM guardados al entrenar."""
+
+    def __init__(self, P: Dict, qbs=None):
+        from app.services.nfl_players import expected_usage, snaps_usage, values_from_dict
+        self.P = P
+        self.values = values_from_dict(P["values"])
+        self.repl = {tuple(k.split("|")): v for k, v in P["repl"].items()}
+        cur = current_season()
+        self.exp = expected_usage(snaps_usage(cur))
+        self.report: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+        try:
+            import nflreadpy as nfl
+            inj = nfl.load_injuries([cur])
+            wk = inj["week"].max()
+            for r in inj.filter(pl.col("week") == wk).iter_rows(named=True):
+                if r["gsis_id"]:
+                    self.report[r["gsis_id"]] = (r["report_status"], r["practice_status"])
+        except Exception as e:
+            logger.warning(f"NFL v2: sin reporte de lesiones de nflverse ({type(e).__name__}: {e})")
+        if qbs is not None:                      # ESPN: estado del día cuando nflverse aún no tiene el oficial
+            for eid, info in qbs.injuries.items():
+                g = qbs.e2g.get(eid)
+                st = (info.get("status") or "")
+                if not g or st.lower() == "active":
+                    continue
+                rs, pr = self.report.get(g, (None, None))
+                self.report[g] = (rs or st, pr)
+        from app.services.nfl_qb_status import espn_to_gsis
+        self.names = espn_to_gsis()[1]
+
+    def adjust(self, r: Dict, mu_v2: float) -> Tuple[float, Dict]:
+        from app.services.nfl_players import injury_adjustment, team_strength
+        s, wk = r["season"], r["week"]
+        out = {"applied": False}
+        usages = {}
+        for side in ("home", "away"):
+            t = r[f"{side}_team"]
+            usages[side] = self.exp.get((s, wk, t)) or self.exp.get((s, -1, t))
+        if not all(u and u["o"] for u in usages.values()):
+            return mu_v2, out
+        st, lost, det = {}, {}, {}
+        for side, u in usages.items():
+            o, d = team_strength(self.values, u)
+            st[side] = o + d
+            lost[side], det[side] = injury_adjustment(self.values, u, self.report, self.P["availability"], self.repl)
+        xe = (st["home"] - st["away"]) * PLAYS_PER_GAME
+        xi = (lost["home"] - lost["away"]) * PLAYS_PER_GAME
+        c = self.P["stack_coef"]
+        pts_per_epa = -c[3]                       # puntos de margen por EPA de bajas
+        mu_adj = c[0] + c[1] * mu_v2 + c[2] * xe + c[3] * xi
+        applied = abs(xi) >= self.P["threshold"]
+        for side in ("home", "away"):
+            rows = sorted(det[side], key=lambda x: -x["lost"])
+            out[f"{side}_injuries"] = [{
+                "name": self.names.get(x["player"], x["player"]), "group": x["group"],
+                "side": "ataque" if x["side"] == "o" else "defensa", "status": self.report.get(x["player"], (None, None))[0],
+                "practice": self.report.get(x["player"], (None, None))[1], "play_prob": x["play_prob"],
+                "usual_share": x["share"], "impact_pts": round(x["lost"] * PLAYS_PER_GAME * pts_per_epa, 2),
+            } for x in rows if abs(x["lost"] * PLAYS_PER_GAME * pts_per_epa) >= 0.05][:8]
+            out[f"{side}_injury_pts"] = round(lost[side] * PLAYS_PER_GAME * pts_per_epa, 2)
+        out.update({"applied": bool(applied), "difference_epa": round(xi, 2), "threshold_epa": round(self.P["threshold"], 2),
+                    "margin_v2": round(mu_v2, 2), "margin_with_injuries": round(mu_adj, 2)})
+        return (mu_adj if applied else mu_v2), out
+
+
 def load_data(refresh: bool = False, refresh_schedules: Optional[bool] = None):
     """Calendario y jugadas. refresh: vuelve a bajar la temporada actual de jugadas;
     refresh_schedules: el calendario (QB titulares, resultados), por defecto igual que refresh."""
@@ -245,6 +365,11 @@ def train(refresh: bool = True) -> Dict:
 
     cm, ct = _fit(Xm[use], margin[use]), _fit(Xt[use], total[use])
     try:
+        players = _train_players(pbp, played, mu, margin)
+    except Exception as e:
+        logger.warning(f"NFL v2: sin ajuste por bajas de jugadores ({type(e).__name__}: {e})")
+        players = None
+    try:
         from app.services.nfl_qb_status import learn_play_probs
         qb_play = learn_play_probs()
     except Exception as e:
@@ -257,7 +382,7 @@ def train(refresh: bool = True) -> Dict:
         "margin_features": MARGIN_FEATURES, "total_features": TOTAL_FEATURES,
         "sigma_margin": sigma, "sigma_total": sigma_t,
         "key_weights": {str(k): v for k, v in dist.weights.items()},
-        "k_cover": k_cover, "k_over": k_over, "k_win": k_win, "qb_play": qb_play,
+        "k_cover": k_cover, "k_over": k_over, "k_win": k_win, "qb_play": qb_play, "players": players,
         "metrics": {"games": int(ok.sum()), "mae_margin": float(np.mean(np.abs(mu[ok] - margin[ok]))),
                     "mae_total": float(np.nanmean(np.abs(mt[ok] - total[ok]))),
                     "mae_market_margin": float(np.mean(np.abs(spread[ok] - margin[ok]))),
@@ -407,6 +532,12 @@ def predict_games_sync(games: List[Tuple], refresh: bool = False) -> Dict[int, D
     except Exception as e:
         logger.warning(f"NFL v2: sin lesiones de ESPN, se usa el titular de nflverse ({type(e).__name__}: {e})")
         qbs = None
+    pnow = None
+    if p.get("players"):
+        try:
+            pnow = PlayersNow(p["players"], qbs)
+        except Exception as e:
+            logger.warning(f"NFL v2: sin bajas por jugador ({type(e).__name__}: {e})")
     out = {}
     for g in games:
         gid, home, away, day = g[:4]
@@ -429,6 +560,12 @@ def predict_games_sync(games: List[Tuple], refresh: bool = False) -> Dict[int, D
         m, t, info = _row_with_lineups(feats, r, qbs, home, away)
         info["precipitation_pct"] = r.get("precipitation_pct")
         mu = float(p["margin_coef"][0] + sum(c * m[k] for c, k in zip(p["margin_coef"][1:], MARGIN_FEATURES)))
+        if pnow is not None and r.get("result") is None:
+            try:
+                mu, inj_info = pnow.adjust(r, mu)
+                info["player_injuries"] = inj_info
+            except Exception as e:
+                logger.warning(f"NFL v2: ajuste por bajas falló en {away} @ {home} ({type(e).__name__}: {e})")
         tot = float(p["total_coef"][0] + sum(c * t[k] for c, k in zip(p["total_coef"][1:], TOTAL_FEATURES)))
         pr = dist.probs(mu)
         hw = _cal(pr["home_win"], p["k_win"])

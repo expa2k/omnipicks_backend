@@ -186,10 +186,12 @@ def espn_to_gsis() -> Tuple[Dict[str, str], Dict[str, str]]:
     df = None
     if os.path.exists(path) and os.path.getmtime(path) > time.time() - 86400:
         df = pl.read_parquet(path)
+        if "pfr_id" not in df.columns:
+            df = None
     if df is None:
         try:
             import nflreadpy as nfl
-            df = nfl.load_players().select(["gsis_id", "espn_id", "display_name", "position"])
+            df = nfl.load_players().select(["gsis_id", "espn_id", "pfr_id", "display_name", "position"])
             os.makedirs(CACHE_DIR, exist_ok=True)
             df.write_parquet(path)
         except Exception as e:

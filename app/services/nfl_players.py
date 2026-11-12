@@ -161,6 +161,14 @@ def usage_from_plays(plays: pl.DataFrame) -> pl.DataFrame:
     return cnt.join(tot, on=["game_id", "team", "side"]).with_columns(share=pl.col("n") / pl.col("n_team"))
 
 
+def values_to_dict(v: "PlayerValues") -> Dict:
+    return {"off": v.off, "dfn": v.dfn, "plays_off": v.plays_off, "plays_def": v.plays_def, "position": v.position}
+
+
+def values_from_dict(d: Dict) -> "PlayerValues":
+    return PlayerValues(d["off"], d["dfn"], d["plays_off"], d["plays_def"], d["position"])
+
+
 def team_strength(values: PlayerValues, usage: Dict[str, Dict[str, float]]) -> Tuple[float, float]:
     """(ataque, defensa) del equipo en EPA por jugada: Σ valor × fracción de jugadas esperada."""
     off = sum(values.off.get(p, 0.0) * s for p, s in usage.get("o", {}).items())
@@ -174,6 +182,8 @@ def expected_usage(use: pl.DataFrame, half_life_games: float = 3.0) -> Dict[Tupl
     (temporada, semana, equipo) → {"o": {jugador: fracción}, "d": {...}}"""
     out = {}
     d = 0.5 ** (1.0 / half_life_games)
+    # Además de cada semana jugada, la clave (temporada, -1, equipo) guarda el uso esperado
+    # después del último partido: es el que se usa para el próximo.
     for (season, team), g in use.group_by(["season", "team"]):
         weeks = sorted(g["week"].unique().to_list())
         acc: Dict[str, Dict[str, List[float]]] = {"o": {}, "d": {}}
@@ -191,7 +201,28 @@ def expected_usage(use: pl.DataFrame, half_life_games: float = 3.0) -> Dict[Tupl
                         acc[side][p][0] += sh
                     else:
                         acc[side][p] = [sh, 1.0]
+        out[(season, -1, team)] = {side: {p: num / den for p, (num, den) in acc[side].items() if den > 0}
+                                   for side in ("o", "d")}
     return out
+
+
+def snaps_usage(season: int) -> pl.DataFrame:
+    """Uso por partido a partir de los snaps (para temporadas sin participación, como 2026): mismo
+    formato que usage_from_plays. Los ids de PFR se pasan a los de nflverse con la tabla de jugadores."""
+    import nflreadpy as nfl
+    from app.services.nfl_qb_status import espn_to_gsis
+    espn_to_gsis()
+    pt = pl.read_parquet(os.path.join(CACHE_DIR, "players.parquet"))
+    pfr = {a: g for a, g in zip(pt["pfr_id"].to_list(), pt["gsis_id"].to_list()) if a and g}
+    sn = nfl.load_snap_counts([season]).with_columns(
+        p=pl.col("pfr_player_id").replace_strict(pfr, default=None),
+        team=pl.col("team").replace({"OAK": "LV", "SD": "LAC", "STL": "LA"}))
+    sn = sn.filter(pl.col("p").is_not_null())
+    o = sn.filter(pl.col("offense_pct") > 0).select("game_id", "season", "week", "team", "p",
+                                                   pl.col("offense_pct").alias("share")).with_columns(side=pl.lit("o"))
+    dd = sn.filter(pl.col("defense_pct") > 0).select("game_id", "season", "week", "team", "p",
+                                                    pl.col("defense_pct").alias("share")).with_columns(side=pl.lit("d"))
+    return pl.concat([o, dd]).select("game_id", "season", "week", "team", "side", "p", "share")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -264,11 +295,14 @@ def learn_availability(inj: pl.DataFrame, use: pl.DataFrame, exp: Dict, min_shar
 
 
 def availability_prob(table: Dict, status: Optional[str], practice: Optional[str]) -> float:
+    """P(juega) relativa a un jugador sano: la tasa aprendida se divide entre la de un jugador sin
+    estado que entrenó completo (~93%), porque hasta los sanos a veces juegan menos por rotación."""
     st = _status_key(status)
     if st == "none" and not practice:
         return 1.0
+    ref = float((table.get("none") or {}).get("full", 1.0)) or 1.0
     cell = table.get(st) or {}
-    return float(cell.get(_practice_key(practice), cell.get("any", 1.0)))
+    return min(1.0, float(cell.get(_practice_key(practice), cell.get("any", 1.0))) / ref)
 
 
 def replacement_levels(values: "PlayerValues", min_plays: float = 50.0) -> Dict[str, float]:
@@ -285,9 +319,11 @@ def replacement_levels(values: "PlayerValues", min_plays: float = 50.0) -> Dict[
 
 
 def injury_adjustment(values: "PlayerValues", usage: Dict[str, Dict[str, float]], report: Dict[str, Tuple[str, str]],
-                      table: Dict, repl: Dict) -> Tuple[float, List[Dict]]:
+                      table: Dict, repl: Dict, skip_groups=()) -> Tuple[float, List[Dict]]:
     """Cuánto pierde el equipo (EPA por jugada) por sus bajas previstas: para cada jugador del reporte,
-    (1 − P(juega)) × su uso esperado × (su valor − el de un suplente de su posición)."""
+    (1 − P(juega)) × su uso esperado × (su valor − el de un suplente de su posición).
+    Incluye al QB: el ajuste final se aprende encima de la v2 (que ya usa al titular), así que la
+    regresión solo le da el peso que agrega. Sacarlo empeoraba 2019–2020 (ver PLAN_NFL_V3.md)."""
     lost, detail = 0.0, []
     for side, vals in (("o", values.off), ("d", values.dfn)):
         for p, sh in usage.get(side, {}).items():
@@ -297,6 +333,8 @@ def injury_adjustment(values: "PlayerValues", usage: Dict[str, Dict[str, float]]
             if prob >= 1.0:
                 continue
             g = POS_GROUP.get(values.position.get(p, ""), "OTHER")
+            if g in skip_groups:
+                continue
             delta = (1 - prob) * sh * (vals.get(p, 0.0) - repl.get((side, g), 0.0))
             lost += delta
             detail.append({"player": p, "side": side, "group": g, "share": round(sh, 2), "play_prob": round(prob, 2),

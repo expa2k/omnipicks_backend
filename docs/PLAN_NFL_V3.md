@@ -153,3 +153,33 @@ El suplente típico es la media del RAPM de los jugadores de su grupo con pocas 
 - **Uso esperado en 2026 a partir de los snaps**, porque no hay participación de 2026. Los snaps traen el id de PFR; se pasa al de nflverse con la tabla de jugadores.
 - **Estado y práctica de la semana:** de nflverse (todas las posiciones) y de ESPN.
 - **Valores RAPM de 2023–2025.** Los novatos y los jugadores sin historial toman el valor de un suplente de su posición.
+
+## Bajas por jugador en producción (12-nov-2026)
+
+**Comparación justa antes de pasarlo.** Contra la v2 de producción, que se entrena desde 2011 y no desde 2018 como en el backtest de la fase 3, la v3 completa **no ganaba en general**: 10.160 contra 10.154. Solo ganaba en los partidos con bajas grandes: 10.058 contra 10.120. Por eso entra como **híbrido**:
+
+    margen = v2                                                si la diferencia de bajas es chica
+    margen = a + b·v2 + c·fuerza por jugadores + d·bajas         si |bajas local − visitante| ≥ p70
+
+El umbral p70 (~1.2–1.3 EPA por partido) se elige con las temporadas de entrenamiento. El ajuste se aprende **encima de la v2**, con la v2 fuera de muestra.
+
+| Versión | 2019–2020 | 2021–2025 (limpia) |
+|---|---|---|
+| v2 de producción | 10.099 | 10.154 |
+| Híbrido, sin el QB en las bajas | 10.124 | 10.142 |
+| **Híbrido, con el QB en las bajas (elegido)** | **10.088** | **10.144** |
+
+Sacar al QB de las bajas parecía evitar contarlo dos veces, pero empeoraba 2019–2020. Como el ajuste se aprende encima de la v2, la regresión solo le da al QB el peso que agrega.
+
+**P(juega)** se normaliza contra la de un jugador sin estado que entrenó completo (~93%). Así, un jugador sano no resta nada solo por estar en el reporte.
+
+**En producción** (`nfl_v2.PlayersNow`):
+- **Uso esperado:** de los **snaps de 2026** (`snaps_usage`; ids de PFR → nflverse), con la misma media con descuento.
+- **Reporte:** el de la semana de nflverse (estado oficial y práctica), completado con el estado del día de ESPN.
+- **Valores RAPM:** con 2023–2025 (`fit_rapm` al entrenar, guardados en `nfl_v2.json`), y suplente típico por posición.
+
+`simulation_details.player_injuries` trae:
+- por equipo: las bajas (nombre, grupo, estado, práctica, P(juega), uso, puntos que cuesta) y el total;
+- si el ajuste se aplicó, y el margen v2 contra el margen con bajas.
+
+**Front:** el bloque "Bajas" de la NFL muestra cada baja con su costo en puntos y dice si movió el pronóstico.
