@@ -166,3 +166,49 @@ class PointsRatingEngine:
         A[np.arange(1, 1 + nt), np.arange(1, 1 + nt)] += ridge
         beta = np.linalg.solve(A + 1e-9 * np.eye(1 + nt), (X * w[:, None]).T @ self.y[mask])
         return float(beta[0]), {t: float(beta[1 + i]) for t, i in self.idx.items()}
+
+
+class ScoringRatingEngine:
+    """Rating de anotación (para el total): por equipo y partido,
+
+        puntos anotados = media + localía + ataque[equipo] − defensa[rival]
+
+    con la misma ponderación por antigüedad y ridge. La media se mueve con los años, así que sigue
+    los cambios de anotación de la liga."""
+
+    def __init__(self, games: pl.DataFrame, params: RatingParams = RatingParams()):
+        self.p = params
+        self.teams = sorted(set(games["home_team"].to_list()) | set(games["away_team"].to_list()))
+        idx = {t: i for i, t in enumerate(self.teams)}
+        self.idx = idx
+        t = time_index(games["season"].to_numpy().astype(float), games["week"].to_numpy().astype(float),
+                       params.offseason_gap)
+        h = np.array([idx[x] for x in games["home_team"].to_list()])
+        a = np.array([idx[x] for x in games["away_team"].to_list()])
+        home = (games["location"].to_numpy() != "Neutral").astype(float)
+        # Dos renglones por partido: el local anotando y el visitante anotando
+        self.t = np.r_[t, t]
+        self.off = np.r_[h, a]
+        self.dfn = np.r_[a, h]
+        self.home = np.r_[home, np.zeros(len(home))]
+        self.y = np.r_[games["home_score"].to_numpy().astype(float), games["away_score"].to_numpy().astype(float)]
+
+    def at(self, season: int, week: int, ridge: float = 4.0):
+        p = self.p
+        t_now = time_index(np.array([season]), np.array([week]), p.offseason_gap)[0]
+        age = t_now - self.t
+        mask = (age > 0) & (age <= p.window * p.half_life)
+        w = 0.5 ** (age[mask] / p.half_life)
+        nt = len(self.teams)
+        n = int(mask.sum())
+        X = np.zeros((n, 2 + 2 * nt))
+        X[:, 0] = 1.0
+        X[:, 1] = self.home[mask]
+        X[np.arange(n), 2 + self.off[mask]] = 1.0
+        X[np.arange(n), 2 + nt + self.dfn[mask]] = -1.0
+        A = (X * w[:, None]).T @ X
+        A[np.arange(2, 2 + 2 * nt), np.arange(2, 2 + 2 * nt)] += ridge
+        beta = np.linalg.solve(A + 1e-9 * np.eye(A.shape[0]), (X * w[:, None]).T @ self.y[mask])
+        off = {t: float(beta[2 + i]) for t, i in self.idx.items()}
+        dfn = {t: float(beta[2 + nt + i]) for t, i in self.idx.items()}
+        return float(beta[0]), float(beta[1]), off, dfn

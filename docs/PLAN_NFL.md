@@ -12,7 +12,7 @@ Hoy la predicción de la NFL es un relleno: el simulador usa `wind_speed` y `qb_
 | 1 | Rating de cada equipo: ataque y defensa en pase y en carrera, ajustados por rival, más un rating por marcador | ✅ |
 | 2 | QB: rating propio de cada QB y cambio del titular cuando no juega | ✅ |
 | 3 | Contexto: localía, descanso (bye, jueves), viaje y husos horarios, división | ✅ probado, no mejora el margen |
-| 4 | De ratings a marcador: margen y total, con la distribución real del margen (números clave 3 y 7) | pendiente |
+| 4 | De ratings a marcador: margen y total, con la distribución real del margen (números clave 3 y 7) | ✅ |
 | 5 | Backtest completo semana a semana, contra el Elo y la línea de cierre (incluye % de spreads cubiertos) | pendiente |
 | 6 | Producción: tareas semanales, predicción congelada, liquidación, historial y front | pendiente |
 
@@ -128,3 +128,40 @@ La distancia es pareja todo el año, así que no es un problema del arranque de 
 - equipos ya clasificados o eliminados.
 
 Ideas para después de la fase 4: bajas por grupo de posición (línea ofensiva, receptores, secundaria), con las que el backtest diga que ayudan, y una marca para "ya clasificado o eliminado" en las semanas 17–18.
+
+## Fase 4: total, marcador y probabilidades
+
+### Total de puntos
+
+- `ScoringRatingEngine` (en `nfl_ratings.py`): por equipo y partido, `puntos = media + localía + ataque − defensa rival`, ajustado por rival y con descuento por antigüedad. Elegidos: vida media de 8 semanas, pausa de 12 y ridge de 8.
+- Además: EPA esperado de los dos ataques, ritmo (jugadas por partido de cada equipo) y clima.
+
+| Modelo | 2015–2020 | 2021–2026 (prueba limpia) |
+|---|---|---|
+| Media de la liga | 11.09 | 10.94 |
+| Rating de anotación | 10.88 | 10.72 |
+| + EPA de los ataques | 10.82 | 10.68 |
+| + ritmo | 10.83 | 10.67 |
+| **+ clima (modelo completo)** | **10.84** | **10.61** |
+| Mercado (total de cierre) | 10.56 | 10.34 |
+
+Clima: el techo suma ~2 puntos, cada mph de viento por encima de 10 resta ~0.34, y el frío casi no importa. La desviación del total alrededor del modelo es de 13.6 puntos.
+
+### Margen con números clave (`app/services/nfl_score.py`)
+
+- `MarginDistribution`: una normal alrededor del margen previsto (σ ≈ 12.9), corregida con un peso por cada margen exacto, aprendido de los partidos jugados. El margen termina en **3 unas 2.5 veces** más de lo que diría la normal, en 7 1.7 veces, y casi nunca en empate (0.29).
+  - Pesos: 0: 0.29 · 1: 0.81 · 2: 0.84 · **3: 2.54** · 4: 0.88 · 6: 1.33 · **7: 1.68** · 8: 0.92 · 10: 1.07 · 14: 1.41 · 17: 1.26.
+- `probs(mu, línea)` da la probabilidad de ganar, de cubrir, de push y de que cubra el rival. `total_probs` hace lo mismo con el over/under.
+- **Margen exacto** (log-loss en 2021–2026): normal 3.980 → con números clave **3.853**.
+- **Push**: con línea de 3 prevé 7.0% (real 10.3%); con línea de 7, 5.1% (real 6.0%); con otras líneas enteras, 2.9% (real 2.5%). Con 3 se queda corto: se podría afinar aprendiendo los pesos según el tamaño del margen previsto.
+
+### Hallazgo clave: contra la línea de cierre el modelo no tiene ventaja
+
+- La probabilidad de cubrir que sale directo del modelo es **peor que decir 50% siempre**: Brier 0.2585, cuando decir siempre 50% da 0.2500. Cuando el modelo difiere de la línea, la mayoría de las veces el que acierta es el mercado.
+- Calibrándola con temporadas anteriores, `P = Φ(k·z)`, el factor **k queda en 0.1–0.25 y bajando**: cada punto de diferencia con la línea vale muy poco. El Brier calibrado queda en 0.2504, prácticamente una moneda.
+- Con la probabilidad calibrada solo 125 partidos de 2021–2026 pasan de 53% (acierto 54.4%), y 23 pasan de 55% (acierto 47.8%). No es una ventaja medible.
+
+**Qué significa para la app:**
+- El modelo sirve para **pronosticar**: ganador, margen, total y probabilidades realistas. Ya es mejor que el Elo y mucho mejor que el relleno.
+- **No va a encontrar valor seguido** contra la línea de cierre. Lo honesto es mostrar casi todo como "sin valor".
+- El backtest de la fase 5 tiene que confirmar esto con apuestas simuladas, y decidir si algún umbral sirve, por ejemplo contra líneas de apertura cuando tengamos las de ESPN.
