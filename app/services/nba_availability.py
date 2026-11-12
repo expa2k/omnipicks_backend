@@ -50,6 +50,8 @@ def _load() -> Dict:
 
 def play_probability(status: str) -> float:
     from app.services.nba_injuries import PLAY_PROBABILITY
+    if status in ("Out", "Out For Season"):
+        return 0.0          # si alguien "fuera" juega es porque cambió su estado después; eso no se aprende
     learned = (_load().get("status") or {}).get(status)
     if learned is not None:
         return float(learned["p"])

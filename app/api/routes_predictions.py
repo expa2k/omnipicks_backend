@@ -106,6 +106,7 @@ async def get_today_predictions(
 async def get_game_predictions(
     sport: Optional[str] = Query(None, description="Filter by sport: nba, nfl, mlb, soccer"),
     game_date: Optional[str] = Query(None, description="Date in YYYY-MM-DD format"),
+    include_finished: bool = Query(False, description="Incluir los partidos ya empezados o terminados de ese día"),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -114,20 +115,23 @@ async def get_game_predictions(
     """
     if game_date:
         target_date = date.fromisoformat(game_date)
+    elif include_finished:
+        target_date = et_today()
     else:
         target_date = await current_slate_date(db, sport.upper() if sport else None)
 
     # 1. Get ALL games for the date using exact ET day boundaries in UTC
     start_utc, end_utc = et_bounds_utc(target_date)
+    if include_finished and not game_date:
+        # Terminados recientes: de ayer (ET) hasta ahora, para que a medianoche no se pierdan los de anoche
+        start_utc = et_bounds_utc(target_date - timedelta(days=1))[0]
+        end_utc = datetime.utcnow()
     
-    games_query = select(Game).where(
-        and_(
-            Game.game_time >= start_utc,
-            Game.game_time <= end_utc,
-            Game.status == GameStatus.SCHEDULED,
-            Game.game_time > datetime.utcnow(),
-        )
-    )
+    games_query = select(Game).where(and_(Game.game_time >= start_utc, Game.game_time <= end_utc))
+    if include_finished:
+        games_query = games_query.where(Game.status != GameStatus.CANCELLED)
+    else:
+        games_query = games_query.where(and_(Game.status == GameStatus.SCHEDULED, Game.game_time > datetime.utcnow()))
     if sport:
         games_query = games_query.where(Game.sport == sport)
     # For MLB, only show actual MLB league games (not minor leagues like PCL, IL, LMB)
@@ -188,6 +192,11 @@ async def get_game_predictions(
             picks_map[pk.game_id] = []
         picks_map[pk.game_id].append(pk)
 
+    # Logos (los manda ESPN; se guardan en la tabla de equipos)
+    from app.db_models import Team
+    team_ids = {g.home_team_id for g in games} | {g.away_team_id for g in games}
+    logos = {t.id: t.logo_url for t in (await db.execute(select(Team).where(Team.id.in_(team_ids)))).scalars().all()}
+
     # 5. Build response
     response_games = []
     for g in games:
@@ -208,6 +217,9 @@ async def get_game_predictions(
             "status": g.status.value if g.status else None,
             "home_score": g.home_score,
             "away_score": g.away_score,
+            "home_logo": logos.get(g.home_team_id) or None,
+            "away_logo": logos.get(g.away_team_id) or None,
+            "result": _result(g, pred),
             "lineups": g.raw_data.get("lineups") if g.raw_data and isinstance(g.raw_data, dict) else None,
             # Prediction (protagonist)
             "prediction": {
@@ -540,4 +552,20 @@ def _odds_summary(odds_list) -> Optional[dict]:
     if tt:
         o = next((x for x in tt if x.sportsbook == "DraftKings"), tt[0])
         out["total"] = {"line": o.total_line, "over_odds": o.over_odds, "under_odds": o.under_odds, "sportsbook": o.sportsbook}
+    return out
+
+
+
+def _result(g, pred) -> Optional[dict]:
+    """Marcador final y si el modelo acertó al ganador (solo partidos terminados)."""
+    if g.status != GameStatus.FINISHED or g.home_score is None or g.away_score is None:
+        return None
+    out = {"home_score": g.home_score, "away_score": g.away_score,
+           "winner": "home" if g.home_score > g.away_score else "away" if g.away_score > g.home_score else "draw"}
+    if pred is not None:
+        probs = {"home": pred.home_win_prob or 0, "away": pred.away_win_prob or 0, "draw": pred.draw_prob or 0}
+        out["model_pick"] = max(probs, key=probs.get)
+        out["hit"] = out["model_pick"] == out["winner"]
+        if pred.predicted_spread is not None:
+            out["margin_error"] = round(abs(-pred.predicted_spread - (g.home_score - g.away_score)), 1)
     return out
