@@ -213,3 +213,49 @@ La distribución del marcador se arma por convolución serie por serie (`team_po
 - Como variable extra, el margen no mejora. El total mejora en 2021–26 (10.43 → 10.41), pero empeora en 2015–20: no es consistente.
 - Como forma de la distribución, es **peor** que la actual. Suponer que los dos equipos anotan de forma independiente, y que las series no dependen del marcador, no refleja cómo se juega. La distribución actual (normal + pesos empíricos de cada margen) ya captura bien los números clave.
 - **Decisión:** no entra a producción. El código queda para probar después versiones con dependencia entre equipos (el que va perdiendo acelera, el que gana gasta reloj).
+
+## Fase 5: todas las variables, y lineal contra LightGBM (`ml/scripts/nfl_gbm_eval.py`) — no entra
+
+**Variables nuevas** (todas se saben antes del partido):
+- EPA sin pérdidas, tasa de éxito y equipos especiales;
+- contexto completo: localía, descanso, bye, semana corta, viaje, husos, temprano para el visitante, división, playoffs;
+- además: **horario estelar, altura (Denver), pasto natural, coach nuevo** y semana de la temporada.
+
+Para el total: lo de la v2 más localía, horario estelar, altura, pasto y semana.
+
+LightGBM: 500 árboles de 7 hojas, tasa 0.02, mínimo 60 partidos por hoja, submuestreo 0.8 y L2 = 5. Igual que el lineal, cada temporada se predice con las anteriores.
+
+| Modelo | 2015–20 | 2021–26 (limpia) |
+|---|---|---|
+| **Margen v2 (lineal, 4 variables)** | **9.975** | 10.082 |
+| Margen, todas las variables, lineal | 10.056 | 10.088 |
+| Margen v2, LightGBM | 10.248 | 10.186 |
+| Margen, todas, LightGBM (error cuadrático) | 10.247 | 10.130 |
+| Margen, todas, LightGBM (error absoluto) | 10.186 | 10.118 |
+| Margen, promedio v2 lineal + LightGBM | 10.035 | **10.069** |
+| **Total v2 (lineal)** | **10.776** | **10.430** |
+| Total, todas, lineal | 10.812 | 10.443 |
+| Total, todas, LightGBM | 10.926 | 10.580 |
+| Total, promedio | 10.789 | 10.474 |
+| Mercado | 9.847 / 10.556 | 9.738 / 10.338 |
+
+**Qué dice:**
+- **La v2 lineal sigue siendo la mejor.** Agregar variables empeora: con ~270 partidos por temporada, cada variable de más mete ruido.
+- LightGBM, que podría captar combinaciones, también es peor: con tan pocos datos se sobreajusta.
+- El promedio de los dos mejora 2021–26 en el margen (10.069 contra 10.082), pero empeora 2015–20 (10.035 contra 9.975): no es consistente.
+- **Decisión:** no entra nada.
+
+## Balance de la v3 (fases 1–5)
+
+| Fase | Idea | ¿Entró? |
+|---|---|---|
+| 1 | RAPM por jugador | Como base de las bajas |
+| 3 | Probabilidad de jugar en todas las posiciones + bajas previstas | ✅ Híbrido sobre la v2 (mejora en los dos periodos) |
+| 4 | Simulación serie por serie | ❌ Peor |
+| 5 | Todas las variables + LightGBM | ❌ Peor |
+
+Con datos públicos, la v2 ya está cerca del límite: margen ~10.1 contra 9.7 del mercado. La diferencia restante es información que el mercado tiene y nflverse no (noticias, ajustes de esquema, dinero informado).
+
+**Lo que queda con posibilidad real:**
+- **Fase 6:** comparar contra las líneas de apertura (que se están guardando desde el 12-nov). Si hay ventaja, suele estar antes de que la línea se mueva.
+- Una simulación con dependencia entre equipos (ritmo según el marcador). Es la única variante de la fase 4 que no se probó.
