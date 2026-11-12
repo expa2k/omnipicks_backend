@@ -7,7 +7,7 @@ así que la fecha que pedimos es la fecha real del partido.
 import httpx
 import logging
 from datetime import date
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +44,31 @@ def _num(d: Dict, *path):
         return float(s)
     except ValueError:
         return None
+
+
+def espn_odds(odds: Dict) -> Optional[Dict]:
+    """Línea de ESPN (DraftKings) de un evento del scoreboard: moneyline, spread y total."""
+    if not odds:
+        return None
+    ml = odds.get("moneyline") or {}
+    ps = odds.get("pointSpread") or {}
+    tt = odds.get("total") or {}
+    return {
+        "provider": odds.get("provider", {}).get("name"),
+        "details": odds.get("details"),
+        "spread": odds.get("spread"),
+        "over_under": odds.get("overUnder"),
+        "ml_home": _num(ml, "home", "close", "odds"), "ml_away": _num(ml, "away", "close", "odds"),
+        "ml_home_open": _num(ml, "home", "open", "odds"), "ml_away_open": _num(ml, "away", "open", "odds"),
+        "spread_home_line": _num(ps, "home", "close", "line"),
+        "spread_home_odds": _num(ps, "home", "close", "odds"), "spread_away_odds": _num(ps, "away", "close", "odds"),
+        "spread_home_open": _num(ps, "home", "open", "line"),
+        "total_line": _num(tt, "over", "close", "line"), "over_odds": _num(tt, "over", "close", "odds"),
+        "under_odds": _num(tt, "under", "close", "odds"), "total_open": _num(tt, "over", "open", "line"),
+        "favorite": "home" if (odds.get("homeTeamOdds") or {}).get("favorite") else
+                    "away" if (odds.get("awayTeamOdds") or {}).get("favorite") else None,
+    }
+
 
 
 async def get_nba_games_espn(target_date: date, use_cache: bool = False) -> List[Dict]:
@@ -91,9 +116,6 @@ async def get_nba_games_espn(target_date: date, use_cache: bool = False) -> List
                     return None
 
             odds = (comp.get("odds") or [{}])[0]
-            ml = odds.get("moneyline") or {}
-            ps = odds.get("pointSpread") or {}
-            tt = odds.get("total") or {}
             games.append({
                 "id": event.get("id"),
                 "date": event.get("date", ""),          # ISO UTC, p.ej. 2026-11-11T00:30Z
@@ -102,21 +124,7 @@ async def get_nba_games_espn(target_date: date, use_cache: bool = False) -> List
                 "teams": {"home": _team(home), "away": _team(away)},
                 "scores": {"home": {"total": _score(home)}, "away": {"total": _score(away)}},
                 # Línea de ESPN (DraftKings): gratis y siempre disponible; es la fuente principal del mercado NBA
-                "espn_odds": {
-                    "provider": odds.get("provider", {}).get("name"),
-                    "details": odds.get("details"),
-                    "spread": odds.get("spread"),
-                    "over_under": odds.get("overUnder"),
-                    "ml_home": _num(ml, "home", "close", "odds"), "ml_away": _num(ml, "away", "close", "odds"),
-                    "ml_home_open": _num(ml, "home", "open", "odds"), "ml_away_open": _num(ml, "away", "open", "odds"),
-                    "spread_home_line": _num(ps, "home", "close", "line"),
-                    "spread_home_odds": _num(ps, "home", "close", "odds"), "spread_away_odds": _num(ps, "away", "close", "odds"),
-                    "spread_home_open": _num(ps, "home", "open", "line"),
-                    "total_line": _num(tt, "over", "close", "line"), "over_odds": _num(tt, "over", "close", "odds"),
-                    "under_odds": _num(tt, "under", "close", "odds"), "total_open": _num(tt, "over", "open", "line"),
-                    "favorite": "home" if (odds.get("homeTeamOdds") or {}).get("favorite") else
-                                "away" if (odds.get("awayTeamOdds") or {}).get("favorite") else None,
-                } if odds else None,
+                "espn_odds": espn_odds(odds),
                 "_source": "espn",
             })
         except Exception as e:

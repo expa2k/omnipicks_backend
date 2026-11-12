@@ -149,20 +149,10 @@ class DataIngestionService:
         date_str = target_date.isoformat()
 
         if sport == SportType.NFL:
-            # ESPN — returns the full current week; filter to target_date after
+            # ESPN devuelve la semana completa; cada partido se guarda con su fecha real (hora ET)
+            from zoneinfo import ZoneInfo
             from app.services.espn_nfl_client import get_nfl_games_espn
-            all_week = await get_nfl_games_espn()   # no date filter → full week
-            # Filter to games whose date matches target_date (or next day for TNF)
-            from datetime import timedelta
-            tomorrow = target_date + timedelta(days=1)
-            games = [
-                g for g in all_week
-                if g.get("game", {}).get("date", {}).get("date") in (
-                    date_str, tomorrow.isoformat()
-                )
-            ]
-            if not games:
-                games = all_week   # fallback: show full week if no match
+            games = await get_nfl_games_espn()
 
             count = 0
             for game_data in games:
@@ -188,30 +178,35 @@ class DataIngestionService:
 
                 game_iso = game_info.get("date", {}).get("time", "")
                 game_time_utc = self._parse_datetime(game_iso)
-                game_date_local = date_str  # use target date as game date
+                game_day = target_date
+                if game_time_utc is not None:
+                    from datetime import timezone
+                    game_day = game_time_utc.replace(tzinfo=timezone.utc).astimezone(ZoneInfo("America/New_York")).date()
 
                 scores   = game_data.get("scores", {})
                 home_score = scores.get("home", {}).get("total") if isinstance(scores.get("home"), dict) else None
                 away_score = scores.get("away", {}).get("total") if isinstance(scores.get("away"), dict) else None
 
-                await self._upsert_game(
+                nfl_game = await self._upsert_game(
                     sport=sport,
                     external_id=str(game_info.get("id")),
                     home_team=home_team,
                     away_team=away_team,
-                    game_date=target_date,
+                    game_date=game_day,
                     game_time=game_time_utc,
                     league="NFL",
-                    season=str(target_date.year),
+                    season=str(game_day.year if game_day.month >= 3 else game_day.year - 1),
                     status=self._map_us_status(game_info.get("status", {}).get("short", "NS")),
                     home_score=home_score,
                     away_score=away_score,
                     raw_data=game_data
                 )
+                await self.db.flush()
+                self.odds_changed += await self._store_espn_odds(nfl_game, game_data.get("espn_odds"))
                 count += 1
 
             await self.db.commit()
-            logger.info(f"Ingested {count} NFL games from ESPN for {date_str}")
+            logger.info(f"Ingested {count} NFL games from ESPN (semana actual)")
             return count
 
         if sport == SportType.NBA:
@@ -360,7 +355,7 @@ class DataIngestionService:
                 .order_by(OddsSnapshot.snapshot_time.desc(), OddsSnapshot.id.desc()).limit(1))).scalar_one_or_none()
             if last is not None and all(getattr(last, k) == v for k, v in vals.items()):
                 continue
-            snap = OddsSnapshot(game_id=game.id, sport=SportType.NBA, sportsbook=book, market=market, **vals)
+            snap = OddsSnapshot(game_id=game.id, sport=game.sport, sportsbook=book, market=market, **vals)
             if market == MarketType.MONEYLINE:
                 snap.implied_home_prob = _implied(vals["home_odds"])
                 snap.implied_away_prob = _implied(vals["away_odds"])

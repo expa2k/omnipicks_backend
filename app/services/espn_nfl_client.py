@@ -8,6 +8,8 @@ import logging
 from typing import Dict, List, Any, Optional
 from datetime import date
 
+from app.services.espn_nba_client import espn_odds
+
 logger = logging.getLogger(__name__)
 
 # Cache para evitar llamadas repetidas en el mismo ciclo
@@ -125,6 +127,7 @@ async def get_nfl_games_espn(target_date: Optional[date] = None) -> List[Dict]:
                     "home": {"total": home_score},
                     "away": {"total": away_score},
                 },
+                "espn_odds": espn_odds((comp.get("odds") or [{}])[0]),
                 "_source": "espn",
             })
         except Exception as e:
