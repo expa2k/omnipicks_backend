@@ -247,7 +247,24 @@ En 2017–2020 algunas reglas salen positivas, como el spread con diferencia ≥
 
 Con las últimas 4 temporadas, la diferencia con la línea no predijo nada, así que el spread y el total salen en 50% ("sin valor"). La app muestra hacia dónde se inclina el modelo, sin recomendarlo.
 
+### QB titular con las lesiones de ESPN (`app/services/nfl_qb_status.py`)
+
+nflverse publica un titular proyectado por partido, pero puede ir atrasado. El 12-nov tenía a Darnold (SEA), que ESPN da Out, y a Huntley (BAL), que está en IR. Por eso, en cada corrida:
+1. Se bajan las lesiones de la NFL de ESPN (`/injuries`) y el depth chart de los QB de cada equipo (core API, `/depthcharts`).
+2. Candidatos, en orden: el titular de nflverse y luego el depth chart. Se descartan Out, IR, suspendidos, PUP y NFI.
+3. El primero que queda es el titular. Si está **Questionable** (80% de que juegue) o **Doubtful** (20%), las variables del QB se promedian con las de su suplente.
+   - Son valores típicos de la NFL, todavía no aprendidos.
+   - Si no hay suplente identificado, se usa uno genérico (nivel de suplente).
+4. Los ids de ESPN se pasan a los de nflverse con la tabla de jugadores (`load_players`, en caché diaria).
+5. Si ESPN no responde (con 3 intentos), se usa el titular de nflverse.
+
+En la app, "Por qué este pronóstico" muestra el estado de cada QB y notas como "Sam Darnold (SEA) está fuera: no se cuenta" o "J.J. McCarthy está en duda: el pronóstico supone 80% que juega y 20% Jameis Winston".
+
+**Deadlock corregido:** las corridas de predicción de la NBA y de la NFL arrancaban a la vez y chocaban en MySQL. Un deadlock deshacía el borrado previo y dejaba predicciones duplicadas.
+- Ahora van una por una (`_predict_lock` en el scheduler).
+- Si el registro falla por un error de base de datos, la corrida se aborta en vez de seguir a medias.
+
 **Pendiente:**
-- Revisar el QB titular con las lesiones de ESPN (hoy sale del calendario de nflverse, que publica titulares proyectados).
+- Aprender la probabilidad de que juegue un QB Questionable o Doubtful con el histórico.
 - Guardar las líneas de apertura para medir si hay ventaja antes de que la línea se mueva.
-- Bajas por grupo de posición.
+- Bajas por grupo de posición (además del QB).

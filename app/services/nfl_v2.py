@@ -304,6 +304,37 @@ def _match(sched: pl.DataFrame, home: str, away: str, day: date) -> Optional[Dic
     return None if best is None else best[1]
 
 
+def _row_with_lineups(feats: Features, r: Dict, qbs, home: str, away: str):
+    """Variables del partido con el QB de cada equipo según ESPN: si el titular está en duda, las
+    del QB se promedian entre él y su suplente con la probabilidad de que juegue."""
+    if qbs is None:
+        return feats.row(r)
+    try:
+        lh = qbs.lineup(home, r.get("home_qb_id"), r.get("home_qb_name"))
+        la = qbs.lineup(away, r.get("away_qb_id"), r.get("away_qb_name"))
+    except Exception as e:
+        logger.warning(f"NFL v2: no se pudo revisar el QB de {away} @ {home} ({type(e).__name__}: {e})")
+        return feats.row(r)
+    m_avg: Dict[str, float] = defaultdict(float)
+    base = None
+    for hq, ph in lh["mix"]:
+        for aq, pa in la["mix"]:
+            r2 = {**r, "home_qb_id": hq, "away_qb_id": aq, "home_qb_name": None, "away_qb_name": None}
+            m, t, info = feats.row(r2)
+            for k, v in m.items():
+                m_avg[k] += ph * pa * v
+            if base is None:
+                base = (t, info)
+    t, info = base
+    for side, l in (("home", lh), ("away", la)):
+        info[f"{side}_qb"].update({
+            "name": l["starter_name"], "status": l["starter_status"], "play_prob": l["starter_prob"],
+            "backup": l["backup_name"], "projected": l["projected_name"], "changed": l["changed"],
+            "ruled_out": l["skipped"],
+        })
+    return dict(m_avg), t, info
+
+
 def predict_games_sync(games: List[Tuple[int, str, str, date]], refresh: bool = False) -> Dict[int, Dict]:
     """[(id, local, visita, fecha ET)] → {id: resultado}. Entrena si los parámetros tienen más de 20 h."""
     p = load_params()
@@ -317,13 +348,19 @@ def predict_games_sync(games: List[Tuple[int, str, str, date]], refresh: bool = 
         sched, pbp = load_data(False, refresh_schedules=False)
     feats = Features(sched, pbp)
     dist = _dist(p)
+    try:
+        from app.services.nfl_qb_status import QBStatus
+        qbs = QBStatus()
+    except Exception as e:
+        logger.warning(f"NFL v2: sin lesiones de ESPN, se usa el titular de nflverse ({type(e).__name__}: {e})")
+        qbs = None
     out = {}
     for gid, home, away, day in games:
         r = _match(sched, home, away, day)
         if r is None:
             logger.warning(f"NFL v2: {away} @ {home} ({day}) no está en el calendario de nflverse")
             continue
-        m, t, info = feats.row(r)
+        m, t, info = _row_with_lineups(feats, r, qbs, home, away)
         mu = float(p["margin_coef"][0] + sum(c * m[k] for c, k in zip(p["margin_coef"][1:], MARGIN_FEATURES)))
         tot = float(p["total_coef"][0] + sum(c * t[k] for c, k in zip(p["total_coef"][1:], TOTAL_FEATURES)))
         pr = dist.probs(mu)

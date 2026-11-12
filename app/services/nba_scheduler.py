@@ -36,6 +36,11 @@ def today_et() -> date:
     return datetime.now(ZoneInfo(TIMEZONE)).date()
 
 
+# Las corridas de predicción (NBA y NFL) escriben en las mismas tablas: una a la vez, para no
+# provocar deadlocks en MySQL (un deadlock deshace el borrado previo y deja duplicados).
+_predict_lock = asyncio.Lock()
+
+
 async def rerun_nba_predictions(reason: str):
     """Vuelve a predecir los partidos NBA de hoy y mañana (hora ET). Gratis: no usa APIs de pago."""
     from app.db_models import SportType
@@ -43,7 +48,7 @@ async def rerun_nba_predictions(reason: str):
     today = today_et()
     for day in (today, today + timedelta(days=1)):
         try:
-            async with get_session_factory()() as db:
+            async with _predict_lock, get_session_factory()() as db:
                 await PredictionEngine(db).run_predictions_for_date(day, sports=[SportType.NBA])
             logger.info(f"Predicciones NBA de {day} recalculadas ({reason})")
         except Exception as e:
@@ -212,7 +217,7 @@ async def job_nfl():
                 Game.sport == SportType.NFL, Game.status == GameStatus.SCHEDULED,
                 Game.game_time > datetime.utcnow(), Game.game_time < datetime.utcnow() + timedelta(days=8)))).scalars().all()
         for day in sorted(days):
-            async with get_session_factory()() as db:
+            async with _predict_lock, get_session_factory()() as db:
                 await PredictionEngine(db).run_predictions_for_date(day, sports=[SportType.NFL])
         logger.info(f"🏈 NFL: {n} partidos de la semana; predicciones de {len(days)} días")
     except Exception as e:

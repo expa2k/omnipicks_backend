@@ -3,6 +3,8 @@ OmniPicks — Prediction Engine Orchestrator
 Coordinates feature engineering, models, and value calculation.
 """
 import asyncio
+
+from sqlalchemy.exc import DBAPIError
 import logging
 import os
 from datetime import date
@@ -147,6 +149,8 @@ class PredictionEngine:
                     v1 = self.simulation_engine.simulate(game.sport, features)
                     if v1.get("predicted_spread") is not None and not (v1.get("simulation_details") or {}).get("error"):
                         await log_prediction(self.db, game, "nba_possessions_v1", v1)
+                except DBAPIError:
+                    raise                       # la transacción ya se deshizo: no seguir a medias
                 except Exception as e:
                     logger.warning(f"NBA: no se pudo guardar la predicción en el registro ({type(e).__name__}: {e})")
             elif game.sport == SportType.NFL and game.id in nfl_v2:
@@ -155,6 +159,8 @@ class PredictionEngine:
                 from app.services.nba_tracking import log_prediction
                 try:
                     await log_prediction(self.db, game, model_name, pred_result)
+                except DBAPIError:
+                    raise                       # la transacción ya se deshizo: no seguir a medias
                 except Exception as e:
                     logger.warning(f"NFL: no se pudo guardar la predicción en el registro ({type(e).__name__}: {e})")
             else:
