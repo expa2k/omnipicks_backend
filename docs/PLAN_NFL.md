@@ -13,7 +13,7 @@ Hoy la predicción de la NFL es un relleno: el simulador usa `wind_speed` y `qb_
 | 2 | QB: rating propio de cada QB y cambio del titular cuando no juega | ✅ |
 | 3 | Contexto: localía, descanso (bye, jueves), viaje y husos horarios, división | ✅ probado, no mejora el margen |
 | 4 | De ratings a marcador: margen y total, con la distribución real del margen (números clave 3 y 7) | ✅ |
-| 5 | Backtest completo semana a semana, contra el Elo y la línea de cierre (incluye % de spreads cubiertos) | pendiente |
+| 5 | Backtest de apuestas semana a semana con momios reales de cierre | ✅ sin ventaja |
 | 6 | Producción: tareas semanales, predicción congelada, liquidación, historial y front | pendiente |
 
 ## Fase 0: datos
@@ -165,3 +165,51 @@ Clima: el techo suma ~2 puntos, cada mph de viento por encima de 10 resta ~0.34,
 - El modelo sirve para **pronosticar**: ganador, margen, total y probabilidades realistas. Ya es mejor que el Elo y mucho mejor que el relleno.
 - **No va a encontrar valor seguido** contra la línea de cierre. Lo honesto es mostrar casi todo como "sin valor".
 - El backtest de la fase 5 tiene que confirmar esto con apuestas simuladas, y decidir si algún umbral sirve, por ejemplo contra líneas de apertura cuando tengamos las de ESPN.
+
+## Fase 5: backtest de apuestas (`ml/scripts/nfl_backtest.py`)
+
+Semana a semana, solo con lo que se sabía antes de cada partido:
+- **Modelo:** margen de la fase 2 y total de la fase 4.
+- **Probabilidades:** con números clave, y cada una calibrada con las temporadas anteriores: `P = Φ(k·z)`.
+- **Apuestas:** 1 unidad con los **momios reales de cierre** (nflverse), cuando el valor esperado (probabilidad × momio decimal − 1) pasa un umbral.
+
+Se reporta 2017–2020 y 2021–2026 por separado; calibrar necesita al menos 500 partidos previos.
+
+### Calibración
+
+| Mercado | k (1 = el modelo crudo está bien) | Brier 2021–26 calibrado | Referencia |
+|---|---|---|---|
+| Spread | 0.26 → 0.09 (bajando cada año) | 0.2504 | 0.2500 = decir 50% |
+| Total | **0.00** | 0.2500 | 0.2500 = decir 50% |
+| Ganador | ~1.1 | 0.2199 | mercado sin margen: **0.2118** |
+
+- En el **total**, la diferencia del modelo con la línea no aporta nada: la calibración la apaga por completo.
+- En el **spread**, aporta casi nada, y cada año menos.
+- En el **ganador**, el modelo está bien calibrado por sí solo, pero el mercado predice mejor (0.212 contra 0.220). Por eso el "valor" que encuentra en moneyline es ficticio.
+
+### Apuestas, prueba limpia 2021–2026
+
+| Regla | Apuestas | Récord | Unidades | ROI (±95%) |
+|---|---|---|---|---|
+| Spread, valor > 0% | 515 | 240-261 | −25.3 | −4.9% (±8.4%) |
+| Spread, valor > 4% | 129 | 57-67 | −10.1 | −7.9% (±16.9%) |
+| Spread, valor > 6% | 66 | 32-31 | +1.3 | +1.9% (±23.9%) |
+| Total, valor > 0% | 153 | 66-86 | −19.1 | −12.5% (±15.8%) |
+| Ganador, valor > 0% | 1,259 | 538-716 | −83.1 | −6.6% (±6.8%) |
+| Spread, el modelo difiere ≥ 3 pts (tipo NBA) | 408 | 197-203 | −21.2 | −5.2% (±9.3%) |
+| Total, el modelo difiere ≥ 3 pts | 407 | 190-212 | −37.7 | −9.3% (±9.3%) |
+| Referencia: siempre el local en el spread | 1,560 | 752-769 | −73.9 | −4.7% (±4.7%) |
+
+En 2017–2020 algunas reglas salen positivas, como el spread con diferencia ≥ 1.5: +4.5% (±7.7%). Pero en 2021–2026 se dan la vuelta, y todas caen dentro del ruido.
+
+### Conclusión
+
+- **No hay ventaja medible en ningún mercado de la NFL** contra la línea de cierre. Casi todas las reglas pierden más o menos lo que cobra el casino (~4.5%). La única positiva (+1.9% en 66 apuestas) es ruido.
+- La regla de la NBA ("el modelo difiere de la línea en 3 pts o más") en la NFL **pierde**: −5.2% en el spread y −9.3% en el total.
+- El modelo sí es bueno para **pronosticar**: es mejor que el Elo, tiene probabilidades de ganar bien calibradas y números clave reales.
+
+**Para producción (fase 6):**
+- Mostrar el pronóstico y las probabilidades.
+- El valor contra el casino, con la probabilidad calibrada. En la práctica casi todo saldrá "sin valor".
+- No recomendar moneyline con la probabilidad del modelo.
+- Guardar las líneas de apertura de ESPN para, más adelante, medir si hay ventaja antes de que la línea se mueva. Ahí es donde suele estar, si es que hay.
