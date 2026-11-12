@@ -526,6 +526,17 @@ async def get_nba_performance(
     return await performance(db, days)
 
 
+@router.get("/nfl/performance")
+async def get_nfl_performance(
+    days: Optional[int] = Query(None, description="Solo los últimos N días"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Rendimiento en vivo del modelo NFL v2 (mismo formato que /nba/performance)."""
+    from app.services.nba_tracking import performance, settle
+    await settle(db)
+    return await performance(db, days, sport="nfl")
+
+
 
 def _dec(american: Optional[float]) -> float:
     if american is None:

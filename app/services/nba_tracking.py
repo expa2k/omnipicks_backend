@@ -156,6 +156,11 @@ def market_picks(home_win_prob: float, pred_margin: Optional[float], pred_total:
 
 
 def log_picks(r: NBAPredictionLog) -> Dict:
+    if r.model_name == "nfl_v2":
+        from app.services.nfl_v2 import nfl_picks
+        return nfl_picks(r.home_win_prob, r.pred_margin, r.pred_total, r.market_margin, r.market_total,
+                         r.ml_home, r.ml_away, r.spread_home_odds, r.spread_away_odds, r.over_odds, r.under_odds,
+                         r.home_pts, r.away_pts, r.home_team, r.away_team)
     from app.services.nba_lineups import team_ids_by_name  # noqa: F401  (nombres → abreviaturas, ver _abbr)
     return market_picks(r.home_win_prob, r.pred_margin, r.pred_total, r.market_margin, r.market_total,
                         r.ml_home, r.ml_away, r.spread_home_odds, r.spread_away_odds, r.over_odds, r.under_odds,
@@ -278,26 +283,46 @@ def _market_records(rows: List[NBAPredictionLog]) -> Dict:
     return out
 
 
-async def performance(db: AsyncSession, days: Optional[int] = None) -> Dict:
-    q = select(NBAPredictionLog).where(NBAPredictionLog.settled_at.is_not(None))
+SPORT_MODELS = {"nba": ("nba_players_v2", ("nba_players_v2", "nba_possessions_v1")),
+                "nfl": ("nfl_v2", ("nfl_v2",))}
+
+
+async def performance(db: AsyncSession, days: Optional[int] = None, sport: str = "nba") -> Dict:
+    """Rendimiento en vivo de un deporte: predicción previa a cada partido contra el resultado y el mercado."""
+    main, models = SPORT_MODELS[sport]
+    q = select(NBAPredictionLog).where(and_(NBAPredictionLog.settled_at.is_not(None),
+                                            NBAPredictionLog.model_name.in_(models)))
     if days:
         q = q.where(NBAPredictionLog.game_date >= date.today() - timedelta(days=days))
     rows = (await db.execute(q.order_by(NBAPredictionLog.game_date.desc()))).scalars().all()
+    if sport == "nfl":
+        from app.services.nfl_v2 import abbr as abbr_fn
+    else:
+        abbr_fn = _abbr
     by_model: Dict[str, List[NBAPredictionLog]] = {}
     for r in rows:
         by_model.setdefault(r.model_name, []).append(r)
     recent = [{
         "date": r.game_date.isoformat(), "matchup": f"{r.away_team} @ {r.home_team}",
-        "away_abbr": _abbr(r.away_team), "home_abbr": _abbr(r.home_team),
+        "away_abbr": abbr_fn(r.away_team), "home_abbr": abbr_fn(r.home_team),
         "home_win_prob": round(r.home_win_prob, 3), "pred_margin": round(r.pred_margin, 1),
         "pred_total": None if r.pred_total is None else round(r.pred_total, 1),
         "market_margin": r.market_margin, "market_total": r.market_total, "final": f"{r.away_pts}-{r.home_pts}",
         "margin": r.home_pts - r.away_pts, "hit": (r.pred_margin > 0) == (r.home_pts > r.away_pts),
         "picks": log_picks(r),
-    } for r in by_model.get("nba_players_v2", [])[:200]]
-    from app.services.nba_game_model import ModelParams
-    bt = ModelParams.load().metrics or {}
-    backtest = {"games": bt.get("n"), "winner_pct": bt.get("acierto"), "logloss": bt.get("logloss"),
-                "mae_margin": bt.get("MAE margen"), "mae_total": bt.get("MAE total")} if bt else None
-    return {"models": {k: _summary(v) for k, v in by_model.items()}, "recent": recent, "backtest": backtest,
-            "pending": (await db.execute(text("SELECT COUNT(*) FROM nba_prediction_log WHERE settled_at IS NULL AND model_name = 'nba_players_v2'"))).scalar()}
+    } for r in by_model.get(main, [])[:200]]
+    if sport == "nfl":
+        from app.services.nfl_v2 import load_params
+        bt = (load_params() or {}).get("metrics") or {}
+        backtest = {"games": bt.get("games"), "winner_pct": bt.get("winner_pct"), "logloss": None,
+                    "mae_margin": bt.get("mae_margin"), "mae_total": bt.get("mae_total"),
+                    "mae_market_margin": bt.get("mae_market_margin")} if bt else None
+    else:
+        from app.services.nba_game_model import ModelParams
+        bt = ModelParams.load().metrics or {}
+        backtest = {"games": bt.get("n"), "winner_pct": bt.get("acierto"), "logloss": bt.get("logloss"),
+                    "mae_margin": bt.get("MAE margen"), "mae_total": bt.get("MAE total")} if bt else None
+    pending = (await db.execute(text("SELECT COUNT(*) FROM nba_prediction_log WHERE settled_at IS NULL AND model_name = :m"),
+                                {"m": main})).scalar()
+    return {"sport": sport, "main_model": main, "models": {k: _summary(v) for k, v in by_model.items()},
+            "recent": recent, "backtest": backtest, "pending": pending}

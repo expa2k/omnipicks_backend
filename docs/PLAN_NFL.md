@@ -252,9 +252,20 @@ Con las últimas 4 temporadas, la diferencia con la línea no predijo nada, así
 nflverse publica un titular proyectado por partido, pero puede ir atrasado. El 12-nov tenía a Darnold (SEA), que ESPN da Out, y a Huntley (BAL), que está en IR. Por eso, en cada corrida:
 1. Se bajan las lesiones de la NFL de ESPN (`/injuries`) y el depth chart de los QB de cada equipo (core API, `/depthcharts`).
 2. Candidatos, en orden: el titular de nflverse y luego el depth chart. Se descartan Out, IR, suspendidos, PUP y NFI.
-3. El primero que queda es el titular. Si está **Questionable** (80% de que juegue) o **Doubtful** (20%), las variables del QB se promedian con las de su suplente.
-   - Son valores típicos de la NFL, todavía no aprendidos.
+3. El primero que queda es el titular. Si está **Questionable** o **Doubtful**, las variables del QB se promedian con las de su suplente, según la probabilidad de que juegue.
    - Si no hay suplente identificado, se usa uno genérico (nivel de suplente).
+   - **Probabilidad aprendida** (`learn_play_probs`, se recalcula en cada entrenamiento). Viene de los reportes oficiales de lesiones de nflverse de 2015–2025, solo con el QB que fue titular el partido anterior:
+
+     | Estado en el reporte final | Casos | Fue titular |
+     |---|---|---|
+     | Questionable, entrenó completo | 37 | **88%** |
+     | Questionable, entrenó limitado | 129 | **54%** |
+     | Questionable, no entrenó | 22 | **48%** |
+     | Questionable (sin dato de práctica) | 188 | **60%** |
+     | Doubtful | 27 | **7%** |
+
+     Antes se usaba 80% y 20%: el Questionable estaba sobreestimado.
+   - **Práctica de la semana:** nflverse la publica a diario (`load_injuries` de la temporada actual), y el estado oficial en cuanto sale el reporte final. Si todavía no hay estado oficial, se usa el de ESPN.
 4. Los ids de ESPN se pasan a los de nflverse con la tabla de jugadores (`load_players`, en caché diaria).
 5. Si ESPN no responde (con 3 intentos), se usa el titular de nflverse.
 
@@ -264,7 +275,16 @@ En la app, "Por qué este pronóstico" muestra el estado de cada QB y notas como
 - Ahora van una por una (`_predict_lock` en el scheduler).
 - Si el registro falla por un error de base de datos, la corrida se aborta en vez de seguir a medias.
 
+### Rendimiento en vivo en la app
+
+- `GET /api/predictions/nfl/performance`: mismo formato que el de la NBA (`performance(db, days, sport="nfl")`):
+  - récord por mercado (todos y solo recomendados), unidades, error del margen y del total;
+  - comparación contra la línea, los últimos partidos con lo que prefería el modelo, y el backtest del entrenamiento.
+- El historial de los picks de la NFL usa sus probabilidades calibradas (`log_picks` → `nfl_picks`).
+- **Front:**
+  - En Bankroll, el historial tiene pestañas NBA y NFL.
+  - En Resumen, el panel "Modelo … en vivo" también.
+
 **Pendiente:**
-- Aprender la probabilidad de que juegue un QB Questionable o Doubtful con el histórico.
 - Guardar las líneas de apertura para medir si hay ventaja antes de que la línea se mueva.
 - Bajas por grupo de posición (además del QB).

@@ -219,6 +219,12 @@ def train(refresh: bool = True) -> Dict:
     k_win = _calib_k(np.array(zw)[sel(seasons_w)], np.array(yw)[sel(seasons_w)])
 
     cm, ct = _fit(Xm[use], margin[use]), _fit(Xt[use], total[use])
+    try:
+        from app.services.nfl_qb_status import learn_play_probs
+        qb_play = learn_play_probs()
+    except Exception as e:
+        logger.warning(f"NFL v2: no se pudo aprender la probabilidad de que juegue el QB ({type(e).__name__}: {e})")
+        qb_play = (load_params() or {}).get("qb_play")
     params = {
         "trained_at": datetime.utcnow().isoformat(timespec="seconds"),
         "last_week": [int(played["season"].max()), int(played.filter(pl.col("season") == played["season"].max())["week"].max())],
@@ -226,7 +232,7 @@ def train(refresh: bool = True) -> Dict:
         "margin_features": MARGIN_FEATURES, "total_features": TOTAL_FEATURES,
         "sigma_margin": sigma, "sigma_total": sigma_t,
         "key_weights": {str(k): v for k, v in dist.weights.items()},
-        "k_cover": k_cover, "k_over": k_over, "k_win": k_win,
+        "k_cover": k_cover, "k_over": k_over, "k_win": k_win, "qb_play": qb_play,
         "metrics": {"games": int(ok.sum()), "mae_margin": float(np.mean(np.abs(mu[ok] - margin[ok]))),
                     "mae_total": float(np.nanmean(np.abs(mt[ok] - total[ok]))),
                     "mae_market_margin": float(np.mean(np.abs(spread[ok] - margin[ok]))),
@@ -330,6 +336,7 @@ def _row_with_lineups(feats: Features, r: Dict, qbs, home: str, away: str):
         info[f"{side}_qb"].update({
             "name": l["starter_name"], "status": l["starter_status"], "play_prob": l["starter_prob"],
             "backup": l["backup_name"], "projected": l["projected_name"], "changed": l["changed"],
+            "practice": l.get("starter_practice"),
             "ruled_out": l["skipped"],
         })
     return dict(m_avg), t, info
@@ -350,7 +357,7 @@ def predict_games_sync(games: List[Tuple[int, str, str, date]], refresh: bool = 
     dist = _dist(p)
     try:
         from app.services.nfl_qb_status import QBStatus
-        qbs = QBStatus()
+        qbs = QBStatus(play_table=(p.get("qb_play") or {}).get("table"))
     except Exception as e:
         logger.warning(f"NFL v2: sin lesiones de ESPN, se usa el titular de nflverse ({type(e).__name__}: {e})")
         qbs = None
