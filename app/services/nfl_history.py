@@ -18,7 +18,7 @@ CACHE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", 
 FIRST_SEASON = 2010
 
 PBP_COLUMNS = [
-    "game_id", "season", "week", "season_type", "game_date", "posteam", "defteam", "home_team", "away_team",
+    "game_id", "play_id", "season", "week", "season_type", "game_date", "posteam", "defteam", "home_team", "away_team",
     "play_type", "pass", "rush", "qb_dropback", "epa", "success", "wp", "down", "half_seconds_remaining",
     "passer_player_id", "passer_player_name", "cpoe", "qb_epa",
     "id", "name", "qb_scramble", "sack",      # id/name: el QB del dropback (también en scrambles y sacks)
@@ -53,7 +53,7 @@ def load_pbp(seasons: Iterable[int], refresh_current: bool = False) -> pl.DataFr
         path = _pbp_path(season)
         if os.path.exists(path) and not (refresh_current and season == cur):
             cached = pl.read_parquet(path)
-            if all(c in cached.columns for c in ("id", "name", "weather", "fumble_lost")) \
+            if all(c in cached.columns for c in ("id", "name", "weather", "fumble_lost", "play_id")) \
                     and os.path.exists(_st_path(season)):                         # caché con las columnas de hoy
                 frames.append(cached)
                 continue

@@ -77,3 +77,40 @@ Así, cada baja (tackle izquierdo, receptor estrella, cornerback, pass rusher) s
 - **Ajuste con la temporada en curso:** snaps, estadísticas por jugador, PFR, NGS y FTN, que sí están al día.
 
 Cuando nflverse publique la participación de 2026, el RAPM se actualiza solo.
+
+## Fase 1: valor de cada jugador (`app/services/nfl_players.py`, `ml/scripts/nfl_players_eval.py`)
+
+**RAPM jugada por jugada:** 252,133 jugadas de 2016–2025, con los 22 jugadores en el campo (sin garbage time):
+
+    EPA de la jugada = Σ ataque[jugadores de ataque] − Σ defensa[jugadores de defensa]
+
+- Ridge con encogimiento por grupo: QB 50 jugadas virtuales, resto 800.
+- Usa las 3 temporadas anteriores, con vida media de 2 temporadas. Cada temporada se predice **solo con las anteriores**.
+- Ranking 2022–2024 coherente:
+  - **Ataque:** Tua, Allen, Purdy, Lamar, Hurts, Carr, Mahomes, Daniels.
+  - **Defensa:** D. Williams, Sweat, Bosa, Cashman, Rousseau, Madubuike.
+
+**Fuerza del equipo** = Σ valor × fracción de jugadas del jugador:
+- **esperada:** su uso con descuento en los partidos previos de la temporada;
+- **real:** quién jugó de verdad. Es el techo, como si se supieran todas las bajas.
+
+**Resultado** (2,090 partidos, semana 2 en adelante, 2018–2025; la regresión se ajusta solo con temporadas previas desde 2018):
+
+| Modelo | 2019–2020 | 2021–2025 (prueba limpia) | Semanas 2–6 (2021–25) |
+|---|---|---|---|
+| v2 (EPA, marcador, QB) | 10.162 | 10.164 | 10.260 |
+| + jugadores (uso esperado) | 10.115 | 10.158 | 10.236 |
+| + jugadores (quién jugó: techo) | 10.126 | 10.138 | 10.235 |
+| **+ esperado + efecto de las bajas** | 10.142 | **10.135** | 10.237 |
+| Solo jugadores | 10.418 | 10.761 | 10.549 |
+| Mercado | 9.980 | 9.776 | 9.826 |
+
+**Qué dice:**
+- El valor por jugador **mejora poco el margen**: −0.03 puntos en la prueba limpia, y solo si se sabe bien quién juega. El rating de equipo y el QB ya capturan casi todo.
+- Las bajas sí mueven partidos concretos. El efecto "quién jugó − esperado" tiene una desviación de 3.9 EPA por partido, y en el 5% de los partidos pasa de 7.8. En promedio pesan poco, pero cuando falta un grupo importante se nota.
+- Para aprovecharlo en producción hace falta la **fase 3**: predecir quién juega con los reportes de lesiones de todos los jugadores. Ahí está el −0.03; sin eso, solo −0.006.
+- Esto coincide con lo que se sabe de la NFL: fuera del QB, el valor de un jugador individual es chico y ruidoso.
+
+**Pendiente de la fase 1:**
+- Afinar el RAPM con estadísticas por posición: presiones (PFR), separación (NGS), snaps. Sirve sobre todo para 2026, que no tiene participación.
+- Mapear los snaps de 2026 (ids de PFR) a los ids de nflverse para el uso esperado en producción.
