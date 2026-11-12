@@ -183,3 +183,33 @@ Sacar al QB de las bajas parecía evitar contarlo dos veces, pero empeoraba 2019
 - si el ajuste se aplicó, y el margen v2 contra el margen con bajas.
 
 **Front:** el bloque "Bajas" de la NFL muestra cada baja con su costo en puntos y dice si movió el pronóstico.
+
+## Fase 4: simulación serie por serie (`app/services/nfl_drives.py`, `ml/scripts/nfl_drives_eval.py`) — no entra
+
+**Datos:** series ofensivas de 2010–2026 (`load_drives`, con caché por temporada y reintentos de descarga). En promedio, por equipo y partido: ~11 series, 2.4 TD, 1.7 goles de campo, 0.3 TD rivales tras pérdida de balón.
+
+**Modelo:**
+- probabilidad de TD y de gol de campo por serie, ajustada por rival (ridge con descuento);
+- series por partido según el ritmo de los dos equipos;
+- puntos que no salen del ataque.
+
+La distribución del marcador se arma por convolución serie por serie (`team_points_pmf`), y de ahí salen el margen y el total.
+
+| | 2015–20 | 2021–26 |
+|---|---|---|
+| Margen v2 | **9.975** | **10.082** |
+| Margen, solo simulación | 10.144 | 10.236 |
+| Margen v2 + simulación | 9.983 | 10.096 |
+| Total v2 | **10.776** | 10.430 |
+| Total, solo simulación | 10.848 | 10.617 |
+| Total v2 + simulación | 10.781 | **10.411** |
+| Margen exacto (log-loss): normal + números clave | **3.864** | **3.852** |
+| Margen exacto: simulación escalada a las medias de la v2 | 3.948 | 3.966 |
+| Cubrir la línea (Brier crudo 2021–26): normal + números clave | — | 0.2582 |
+| Cubrir la línea: simulación | — | 0.2570 |
+
+**Qué dice:**
+- Como modelo propio, la simulación es peor que la v2.
+- Como variable extra, el margen no mejora. El total mejora en 2021–26 (10.43 → 10.41), pero empeora en 2015–20: no es consistente.
+- Como forma de la distribución, es **peor** que la actual. Suponer que los dos equipos anotan de forma independiente, y que las series no dependen del marcador, no refleja cómo se juega. La distribución actual (normal + pesos empíricos de cada margen) ya captura bien los números clave.
+- **Decisión:** no entra a producción. El código queda para probar después versiones con dependencia entre equipos (el que va perdiendo acelera, el que gana gasta reloj).
