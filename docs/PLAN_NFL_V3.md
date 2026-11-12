@@ -114,3 +114,42 @@ Cuando nflverse publique la participación de 2026, el RAPM se actualiza solo.
 **Pendiente de la fase 1:**
 - Afinar el RAPM con estadísticas por posición: presiones (PFR), separación (NGS), snaps. Sirve sobre todo para 2026, que no tiene participación.
 - Mapear los snaps de 2026 (ids de PFR) a los ids de nflverse para el uso esperado en producción.
+
+## Fase 3: quién juega, todas las posiciones (`nfl_players.py`, `ml/scripts/nfl_availability_eval.py`)
+
+**P(juega | estado, práctica)**, aprendida con 2016–2020: reportes finales de lesiones de nflverse cruzados con la participación. Solo cuentan jugadores con uso esperado ≥ 25%; "jugó" = estuvo en al menos un tercio de su uso esperado.
+
+| Estado | Casos | Juega | Entrenó completo | Limitado | No entrenó |
+|---|---|---|---|---|---|
+| Questionable | 4,952 | 67% | 86% | 69% | 40% |
+| Doubtful | 531 | 1% | — | — | — |
+| Out | 2,687 | 0% | — | — | — |
+| Sin estado (solo práctica) | 9,772 | 92% | 93% | 93% | 78% |
+
+**Bajas previstas:** para cada jugador del reporte,
+
+    pérdida = (1 − P(juega)) × su uso esperado × (su valor RAPM − el de un suplente de su posición)
+
+El suplente típico es la media del RAPM de los jugadores de su grupo con pocas jugadas.
+
+**Resultado** (2021–2025 es la prueba limpia):
+
+| Modelo | 2019–2020 | 2021–2025 | 2021–25, partidos con bajas grandes |
+|---|---|---|---|
+| v2 (EPA, marcador, QB) | 10.162 | 10.164 | 10.084 |
+| + jugadores (uso esperado, sin lesiones) | 10.115 | 10.158 | 10.110 |
+| **+ jugadores con bajas previstas** | 10.116 | **10.152** | **10.010** |
+| + jugadores (quién jugó: techo) | 10.142 | 10.135 | 10.028 |
+| Mercado | 9.980 | 9.776 | 9.584 |
+
+"Bajas grandes" = el 20% de partidos con más diferencia de bajas previstas entre los equipos (≥ 1.9 EPA por partido).
+
+**Qué dice:**
+- En general la mejora es chica: −0.012 puntos.
+- En los partidos con bajas importantes, **el error baja 0.07 puntos**, e incluso queda mejor que el techo. Es justo donde la v2 no sabía nada fuera del QB.
+- El mercado sigue adelante (9.58 en esos partidos): sabe de las bajas y además de su contexto (quién entra, esquemas).
+
+**Para producción hace falta:**
+- **Uso esperado en 2026 a partir de los snaps**, porque no hay participación de 2026. Los snaps traen el id de PFR; se pasa al de nflverse con la tabla de jugadores.
+- **Estado y práctica de la semana:** de nflverse (todas las posiciones) y de ESPN.
+- **Valores RAPM de 2023–2025.** Los novatos y los jugadores sin historial toman el valor de un suplente de su posición.

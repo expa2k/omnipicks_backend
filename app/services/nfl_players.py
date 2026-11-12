@@ -192,3 +192,113 @@ def expected_usage(use: pl.DataFrame, half_life_games: float = 3.0) -> Dict[Tupl
                     else:
                         acc[side][p] = [sh, 1.0]
     return out
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Fase 3: quién juega (lesión + práctica) y fuerza del equipo con las bajas previstas
+# ══════════════════════════════════════════════════════════════════════
+
+def load_injury_reports(seasons: Iterable[int]) -> pl.DataFrame:
+    """Reporte final de lesiones por jugador y semana (nflverse), con su práctica."""
+    import nflreadpy as nfl
+    path = os.path.join(CACHE_DIR, "injuries_hist.parquet")
+    seasons = list(seasons)
+    if os.path.exists(path):
+        cached = pl.read_parquet(path)
+        have = set(cached["season"].unique().to_list())
+        missing = [s for s in seasons if s not in have]
+    else:
+        cached, missing = None, seasons
+    frames = [cached] if cached is not None else []
+    if missing:
+        d = nfl.load_injuries(missing).select(
+            pl.col("season").cast(pl.Int32), pl.col("week").cast(pl.Int32), "team", "gsis_id", "position",
+            "report_status", "practice_status")
+        frames.append(d)
+        out = pl.concat(frames, how="diagonal_relaxed")
+        out.write_parquet(path)
+    else:
+        out = cached
+    out = out.with_columns(pl.col("team").replace({"OAK": "LV", "SD": "LAC", "STL": "LA"}))
+    return out.filter(pl.col("season").is_in(seasons) & pl.col("gsis_id").is_not_null())
+
+
+def _practice_key(p: Optional[str]) -> str:
+    p = (p or "").lower()
+    return "full" if p.startswith("full") else "limited" if p.startswith("limited") else "dnp" if p.startswith("did not") else "none"
+
+
+def _status_key(s: Optional[str]) -> str:
+    s = (s or "").lower()
+    return s if s in ("out", "doubtful", "questionable") else "none"
+
+
+def learn_availability(inj: pl.DataFrame, use: pl.DataFrame, exp: Dict, min_share: float = 0.25,
+                       smooth: float = 10.0) -> Dict[str, Dict[str, float]]:
+    """P(juega | estado, práctica) aprendida: un jugador con uso esperado ≥ min_share cuenta como
+    "jugó" si estuvo en al menos un tercio de su uso esperado. Encogido hacia la tasa del estado."""
+    played = {}
+    for r in use.iter_rows(named=True):
+        played[(r["season"], r["week"], r["team"], r["p"])] = max(played.get((r["season"], r["week"], r["team"], r["p"]), 0.0), r["share"])
+    rows = []
+    for r in inj.iter_rows(named=True):
+        e = exp.get((r["season"], r["week"], r["team"]))
+        if not e:
+            continue
+        sh = max(e["o"].get(r["gsis_id"], 0.0), e["d"].get(r["gsis_id"], 0.0))
+        if sh < min_share:
+            continue
+        got = played.get((r["season"], r["week"], r["team"], r["gsis_id"]), 0.0)
+        rows.append((_status_key(r["report_status"]), _practice_key(r["practice_status"]), 1.0 if got >= sh / 3 else 0.0))
+    df = pl.DataFrame(rows, schema=["status", "practice", "played"], orient="row")
+    out = {}
+    for st, g in df.group_by("status"):
+        st = st[0] if isinstance(st, tuple) else st
+        base = float(g["played"].mean())
+        cell = {"any": round(base, 3), "n": g.height}
+        for pr, gg in g.group_by("practice"):
+            pr = pr[0] if isinstance(pr, tuple) else pr
+            cell[pr] = round((float(gg["played"].sum()) + smooth * base) / (gg.height + smooth), 3)
+        out[st] = cell
+    return out
+
+
+def availability_prob(table: Dict, status: Optional[str], practice: Optional[str]) -> float:
+    st = _status_key(status)
+    if st == "none" and not practice:
+        return 1.0
+    cell = table.get(st) or {}
+    return float(cell.get(_practice_key(practice), cell.get("any", 1.0)))
+
+
+def replacement_levels(values: "PlayerValues", min_plays: float = 50.0) -> Dict[str, float]:
+    """Valor de un suplente típico por grupo de posición: media del RAPM de los jugadores con pocas jugadas."""
+    out = {}
+    for side, vals, cnt in (("o", values.off, values.plays_off), ("d", values.dfn, values.plays_def)):
+        by = defaultdict(list)
+        for p, v in vals.items():
+            if cnt.get(p, 0) < 400 and cnt.get(p, 0) >= min_plays:
+                by[POS_GROUP.get(values.position.get(p, ""), "OTHER")].append(v)
+        for g, l in by.items():
+            out[(side, g)] = float(np.mean(l))
+    return out
+
+
+def injury_adjustment(values: "PlayerValues", usage: Dict[str, Dict[str, float]], report: Dict[str, Tuple[str, str]],
+                      table: Dict, repl: Dict) -> Tuple[float, List[Dict]]:
+    """Cuánto pierde el equipo (EPA por jugada) por sus bajas previstas: para cada jugador del reporte,
+    (1 − P(juega)) × su uso esperado × (su valor − el de un suplente de su posición)."""
+    lost, detail = 0.0, []
+    for side, vals in (("o", values.off), ("d", values.dfn)):
+        for p, sh in usage.get(side, {}).items():
+            if p not in report or sh <= 0:
+                continue
+            prob = availability_prob(table, *report[p])
+            if prob >= 1.0:
+                continue
+            g = POS_GROUP.get(values.position.get(p, ""), "OTHER")
+            delta = (1 - prob) * sh * (vals.get(p, 0.0) - repl.get((side, g), 0.0))
+            lost += delta
+            detail.append({"player": p, "side": side, "group": g, "share": round(sh, 2), "play_prob": round(prob, 2),
+                           "value": round(vals.get(p, 0.0), 4), "lost": round(delta, 4)})
+    return lost, detail
