@@ -66,12 +66,18 @@ async def ingest_nba_schedule():
     from app.services.data_ingestion import DataIngestionService
     today = today_et()
     total = 0
+    changed = 0
     for day in (today - timedelta(days=1), today, today + timedelta(days=1)):
         try:
             async with get_session_factory()() as db:
-                total += await DataIngestionService(db)._ingest_nba_espn(day)
+                svc = DataIngestionService(db)
+                total += await svc._ingest_nba_espn(day)
+                changed += svc.odds_changed
         except Exception as e:
             logger.warning(f"Calendario NBA de {day}: no se pudo cargar ({type(e).__name__}: {e})")
+    if changed:
+        logger.info(f"Líneas NBA (ESPN/DraftKings): {changed} actualizadas")
+    ingest_nba_schedule.last_odds_changed = changed
     return total
 
 
@@ -113,6 +119,9 @@ async def job_sync_injuries():
     except Exception as e:
         logger.warning(f"Lesiones NBA: no se pudo actualizar ({type(e).__name__}: {e})")
         return
+    # Calendario, marcadores y líneas de ESPN (gratis): mantiene el mercado al día
+    await ingest_nba_schedule()
+    odds_changed = getattr(ingest_nba_schedule, "last_odds_changed", 0)
     await settle_predictions()
     # Reporte oficial de la NBA (PDF cada 15 min); si falla, queda ESPN
     official = {}
@@ -127,8 +136,8 @@ async def job_sync_injuries():
     except Exception as e:
         logger.warning(f"Reporte oficial NBA: no se pudo leer ({type(e).__name__}: {e})")
     # Se re-simula solo si cambió algo en alguno de los dos reportes
-    if result.get("new") or result.get("changed") or result.get("cleared") or official.get("changed"):
-        await rerun_nba_predictions(f"lesiones: ESPN {result} · oficial {official.get('changed', 0)} cambios")
+    if result.get("new") or result.get("changed") or result.get("cleared") or official.get("changed") or odds_changed:
+        await rerun_nba_predictions(f"lesiones: ESPN {result} · oficial {official.get('changed', 0)} cambios · líneas {odds_changed}")
 
 
 def update_history_sync() -> dict:

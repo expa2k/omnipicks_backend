@@ -29,6 +29,23 @@ _STATUS_MAP = {
 _scoreboard_cache: Dict[str, List[Dict]] = {}
 
 
+def _num(d: Dict, *path):
+    """Número de un camino anidado de ESPN ("-410", "+9.5", "o221.5", "EVEN") o None."""
+    for k in path:
+        if not isinstance(d, dict):
+            return None
+        d = d.get(k)
+    if d is None:
+        return None
+    s = str(d).strip().lower().lstrip("ou")
+    if s in ("even", "ev", "pk", "pick"):
+        return 100.0 if path[-1] == "odds" else 0.0
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
 async def get_nba_games_espn(target_date: date, use_cache: bool = False) -> List[Dict]:
     """Partidos de NBA de un día, normalizados al formato que usa el resto del backend."""
     key = target_date.strftime("%Y%m%d")
@@ -74,6 +91,9 @@ async def get_nba_games_espn(target_date: date, use_cache: bool = False) -> List
                     return None
 
             odds = (comp.get("odds") or [{}])[0]
+            ml = odds.get("moneyline") or {}
+            ps = odds.get("pointSpread") or {}
+            tt = odds.get("total") or {}
             games.append({
                 "id": event.get("id"),
                 "date": event.get("date", ""),          # ISO UTC, p.ej. 2026-11-11T00:30Z
@@ -81,12 +101,21 @@ async def get_nba_games_espn(target_date: date, use_cache: bool = False) -> List
                 "venue": {"name": comp.get("venue", {}).get("fullName", "")},
                 "teams": {"home": _team(home), "away": _team(away)},
                 "scores": {"home": {"total": _score(home)}, "away": {"total": _score(away)}},
-                # Línea de ESPN (DraftKings) como referencia; no reemplaza a The Odds API todavía
+                # Línea de ESPN (DraftKings): gratis y siempre disponible; es la fuente principal del mercado NBA
                 "espn_odds": {
                     "provider": odds.get("provider", {}).get("name"),
                     "details": odds.get("details"),
                     "spread": odds.get("spread"),
                     "over_under": odds.get("overUnder"),
+                    "ml_home": _num(ml, "home", "close", "odds"), "ml_away": _num(ml, "away", "close", "odds"),
+                    "ml_home_open": _num(ml, "home", "open", "odds"), "ml_away_open": _num(ml, "away", "open", "odds"),
+                    "spread_home_line": _num(ps, "home", "close", "line"),
+                    "spread_home_odds": _num(ps, "home", "close", "odds"), "spread_away_odds": _num(ps, "away", "close", "odds"),
+                    "spread_home_open": _num(ps, "home", "open", "line"),
+                    "total_line": _num(tt, "over", "close", "line"), "over_odds": _num(tt, "over", "close", "odds"),
+                    "under_odds": _num(tt, "under", "close", "odds"), "total_open": _num(tt, "over", "open", "line"),
+                    "favorite": "home" if (odds.get("homeTeamOdds") or {}).get("favorite") else
+                                "away" if (odds.get("awayTeamOdds") or {}).get("favorite") else None,
                 } if odds else None,
                 "_source": "espn",
             })

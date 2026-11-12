@@ -6,7 +6,9 @@ from app.db_models import Prediction, OddsSnapshot, MarketType, SportType
 import math
 
 # Desviación típica histórica del total de puntos (deportes de marcador alto → Normal)
-_TOTAL_SD = {SportType.NBA: 17.0, SportType.NFL: 13.5}
+_TOTAL_SD = {SportType.NBA: 18.5, SportType.NFL: 13.5}     # NBA: σ del total del backtest de v2
+# Desviación típica del margen final (NBA: backtest de v2)
+_MARGIN_SD = {SportType.NBA: 13.8, SportType.NFL: 13.5}
 
 class ValueCalculator:
     def _poisson_prob(self, lam: float, k: int) -> float:
@@ -131,6 +133,36 @@ class ValueCalculator:
                     if key not in best_picks or best_sp_pick["expected_value"] > best_picks[key]["expected_value"]:
                         best_picks[key] = best_sp_pick
                         
+            elif (odds.market == MarketType.SPREAD and odds.spread_home is not None
+                  and prediction.predicted_spread is not None and prediction.sport in _MARGIN_SD):
+                # Margen ~ Normal: el local cubre si margen + spread_local > 0
+                sd = _MARGIN_SD[prediction.sport]
+                mu = -prediction.predicted_spread                     # margen esperado del local
+                p_home = 0.5 * (1 + math.erf((mu + odds.spread_home) / (sd * math.sqrt(2))))
+                best_side = None
+                for side, prob, price, line, name in (
+                        ("home", p_home, odds.spread_home_odds, odds.spread_home, game.home_team_name),
+                        ("away", 1 - p_home, odds.spread_away_odds, -odds.spread_home, game.away_team_name)):
+                    if not price:
+                        continue
+                    dec_odds = self._american_to_decimal(price)
+                    ev = self.calculate_ev(prob, dec_odds)
+                    if ev > 0.02 and (best_side is None or ev > best_side["expected_value"]):
+                        imp_prob = self._american_to_implied_prob(price)
+                        kelly = self._calculate_kelly(prob, dec_odds)
+                        best_side = {
+                            "market": MarketType.SPREAD, "pick_type": f"{side}_spread",
+                            "pick_description": f"{name} {line:+g}",
+                            "model_probability": prob, "model_edge": prob - imp_prob, "expected_value": ev,
+                            "best_sportsbook": odds.sportsbook, "best_odds": price, "best_odds_decimal": dec_odds,
+                            "implied_probability": imp_prob, "kelly_fraction": kelly,
+                            "recommended_stake_pct": min(kelly * 0.5 * 100, 5.0),
+                            "value_rating": min(5, max(1, int(ev * 100))),
+                        }
+                if best_side and (MarketType.SPREAD not in best_picks
+                                  or best_side["expected_value"] > best_picks[MarketType.SPREAD]["expected_value"]):
+                    best_picks[MarketType.SPREAD] = best_side
+
             elif odds.market == MarketType.OVER_UNDER and odds.total_line and prediction.predicted_total:
                 under_prob = self._calc_under_prob(prediction.predicted_total, odds.total_line, prediction.sport)
                 over_prob = 1.0 - under_prob

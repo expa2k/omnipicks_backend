@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 class DataIngestionService:
     """Orchestrates pulling data from all APIs and saving to database."""
 
+    odds_changed = 0
+
     def __init__(self, db: AsyncSession):
         self.db = db
         self.apisports = APISportsClient()
@@ -312,7 +314,7 @@ class DataIngestionService:
             )
 
             season_start = target_date.year if target_date.month >= 10 else target_date.year - 1
-            await self._upsert_game(
+            game = await self._upsert_game(
                 sport=SportType.NBA,
                 external_id=f"espn_{g['id']}",
                 home_team=home_team,
@@ -327,11 +329,44 @@ class DataIngestionService:
                 away_score=g["scores"]["away"]["total"],
                 raw_data=g,
             )
+            await self.db.flush()
+            self.odds_changed += await self._store_espn_odds(game, g.get("espn_odds"))
             count += 1
 
         await self.db.commit()
         logger.info(f"Ingested {count} NBA games from ESPN for {target_date.isoformat()}")
         return count
+
+    async def _store_espn_odds(self, game: Game, eo: Optional[Dict[str, Any]]) -> int:
+        """Guarda las líneas de DraftKings que trae ESPN (moneyline, spread y total).
+        Solo inserta una foto nueva si la línea cambió desde la última."""
+        if not eo or game.status not in (None, GameStatus.SCHEDULED):
+            return 0
+        book = "DraftKings"
+        wanted = []
+        if eo.get("ml_home") is not None and eo.get("ml_away") is not None:
+            wanted.append((MarketType.MONEYLINE, {"home_odds": eo["ml_home"], "away_odds": eo["ml_away"]}))
+        if eo.get("spread_home_line") is not None:
+            wanted.append((MarketType.SPREAD, {"spread_home": eo["spread_home_line"], "spread_home_odds": eo.get("spread_home_odds"),
+                                              "spread_away_odds": eo.get("spread_away_odds")}))
+        if eo.get("total_line") is not None:
+            wanted.append((MarketType.OVER_UNDER, {"total_line": eo["total_line"], "over_odds": eo.get("over_odds"),
+                                                  "under_odds": eo.get("under_odds")}))
+        added = 0
+        for market, vals in wanted:
+            last = (await self.db.execute(
+                select(OddsSnapshot).where(and_(OddsSnapshot.game_id == game.id, OddsSnapshot.sportsbook == book,
+                                                OddsSnapshot.market == market))
+                .order_by(OddsSnapshot.snapshot_time.desc(), OddsSnapshot.id.desc()).limit(1))).scalar_one_or_none()
+            if last is not None and all(getattr(last, k) == v for k, v in vals.items()):
+                continue
+            snap = OddsSnapshot(game_id=game.id, sport=SportType.NBA, sportsbook=book, market=market, **vals)
+            if market == MarketType.MONEYLINE:
+                snap.implied_home_prob = _implied(vals["home_odds"])
+                snap.implied_away_prob = _implied(vals["away_odds"])
+            self.db.add(snap)
+            added += 1
+        return added
 
     async def ingest_daily_games(self, target_date: date):
         """Run all daily game ingestion for today only (to save API quotas)."""
@@ -359,7 +394,8 @@ class DataIngestionService:
                         home_name = event.get("home_team")
                         away_name = event.get("away_team")
                         
-                        game = await self._find_game_by_teams_approx(sport, home_name, away_name)
+                        game = await self._find_game_by_teams_approx(sport, home_name, away_name,
+                                                                     self._parse_datetime(event.get("commence_time")))
                         if not game:
                             continue
                             
@@ -398,6 +434,14 @@ class DataIngestionService:
                                     elif oc.get("name").lower() == "draw":
                                         snapshot.draw_odds = oc.get("price")
                             
+                            elif internal_market == "spread":
+                                for oc in outcomes:
+                                    if oc.get("name") == home_name:
+                                        snapshot.spread_home = oc.get("point")
+                                        snapshot.spread_home_odds = oc.get("price")
+                                    elif oc.get("name") == away_name:
+                                        snapshot.spread_away_odds = oc.get("price")
+
                             elif internal_market == "over_under":
                                 for oc in outcomes:
                                     # Example name: "Over", "Under", point: 2.5
@@ -471,24 +515,29 @@ class DataIngestionService:
                     setattr(game, k, v)
         return game
 
-    async def _find_game_by_teams_approx(self, sport: SportType, home_name: str, away_name: str) -> Optional[Game]:
-        """Attempt to fuzzy match an event from Odds API to our Game DB."""
-        from datetime import datetime, timedelta
+    async def _find_game_by_teams_approx(self, sport: SportType, home_name: str, away_name: str,
+                                         commence: Optional[datetime] = None) -> Optional[Game]:
+        """Empareja un evento de The Odds API con un partido nuestro.
+
+        Compara nombres normalizados (sin acentos, con alias como "LA Clippers" = "Los Angeles
+        Clippers") y, si viene la hora de inicio, exige que esté a menos de 12 h: hay series de
+        dos partidos seguidos entre los mismos equipos.
+        """
+        from datetime import timedelta
         if not home_name or not away_name:
             return None
-            
-        time_threshold = datetime.utcnow() - timedelta(hours=24)
-        result = await self.db.execute(
-            select(Game).where(
-                and_(
-                    Game.sport == sport,
-                    Game.game_time >= time_threshold,
-                    Game.home_team_name.ilike(f"%{home_name[:4]}%"),
-                    Game.away_team_name.ilike(f"%{away_name[:4]}%")
-                )
-            ).order_by(Game.game_time.asc()).limit(1)
-        )
-        return result.scalar_one_or_none()
+        lo = (commence - timedelta(hours=12)) if commence else datetime.utcnow() - timedelta(hours=24)
+        hi = (commence + timedelta(hours=12)) if commence else datetime.utcnow() + timedelta(days=3)
+        cands = (await self.db.execute(
+            select(Game).where(and_(Game.sport == sport, Game.game_time >= lo, Game.game_time <= hi))
+            .order_by(Game.game_time.asc()))).scalars().all()
+        h, a = _team_key(home_name), _team_key(away_name)
+        exact = [g for g in cands if _team_key(g.home_team_name) == h and _team_key(g.away_team_name) == a]
+        if exact:
+            return min(exact, key=lambda g: abs((g.game_time - commence).total_seconds()) if commence and g.game_time else 0)
+        # Respaldo (fútbol, nombres con sufijos distintos): uno contiene al otro
+        loose = [g for g in cands if _similar(_team_key(g.home_team_name), h) and _similar(_team_key(g.away_team_name), a)]
+        return loose[0] if len(loose) == 1 else None
 
     def _parse_datetime(self, dt_str) -> Optional[datetime]:
         """Safely parse API ISO datetimes into UTC datetime objects."""
@@ -520,3 +569,35 @@ class DataIngestionService:
         if status_str in ["pst"]: return GameStatus.POSTPONED
         if status_str in ["canc"]: return GameStatus.CANCELLED
         return GameStatus.SCHEDULED
+
+
+
+# ── Emparejamiento de nombres entre fuentes ──────────────────────────
+_TEAM_ALIASES = {
+    "la clippers": "los angeles clippers", "la lakers": "los angeles lakers",
+    "ny knicks": "new york knicks", "gs warriors": "golden state warriors",
+}
+
+
+def _team_key(name: Optional[str]) -> str:
+    import re
+    import unicodedata
+    s = unicodedata.normalize("NFKD", name or "").encode("ascii", "ignore").decode().lower()
+    s = re.sub(r"[^a-z0-9 ]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return _TEAM_ALIASES.get(s, s)
+
+
+def _similar(a: str, b: str) -> bool:
+    if not a or not b:
+        return False
+    if a in b or b in a:
+        return True
+    wa, wb = set(a.split()) - {"fc", "cf", "club", "de", "the"}, set(b.split()) - {"fc", "cf", "club", "de", "the"}
+    return bool(wa and wb) and len(wa & wb) / min(len(wa), len(wb)) >= 0.6
+
+
+def _implied(american: Optional[float]) -> Optional[float]:
+    if american is None:
+        return None
+    return 100.0 / (american + 100.0) if american > 0 else -american / (-american + 100.0)

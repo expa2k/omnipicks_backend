@@ -5,7 +5,7 @@ OmniPicks — Predictions API Routes
 from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional, List
 
 from app.database import get_db
@@ -14,6 +14,50 @@ from app.db_models import (
 )
 
 router = APIRouter()
+
+
+# ── Fechas en hora del Este de EE. UU. (la de la cartelera de NBA, NFL y MLB) ──
+from zoneinfo import ZoneInfo
+_ET = ZoneInfo("America/New_York")
+
+
+def et_today() -> date:
+    return datetime.now(_ET).date()
+
+
+def et_bounds_utc(d: date):
+    """Inicio y fin del día `d` en hora del Este, como UTC sin zona (así se guarda game_time)."""
+    start = datetime(d.year, d.month, d.day, tzinfo=_ET).astimezone(timezone.utc).replace(tzinfo=None)
+    return start, start + timedelta(days=1)
+
+
+async def current_slate_date(db: AsyncSession, sport: Optional[str] = None) -> date:
+    """El día que se muestra por defecto: hoy (ET) si quedan partidos por empezar; si no, el
+    siguiente día con partidos programados (hasta 3 días adelante)."""
+    now = datetime.utcnow()
+    for k in range(4):
+        d = et_today() + timedelta(days=k)
+        start, end = et_bounds_utc(d)
+        q = select(func.count(Game.id)).where(and_(Game.game_time >= max(start, now), Game.game_time < end,
+                                                    Game.status == GameStatus.SCHEDULED))
+        if sport:
+            q = q.where(Game.sport == sport)
+        if (await db.execute(q)).scalar():
+            return d
+    return et_today()
+
+
+def pick_tier(edge: Optional[float]) -> str:
+    """Qué tan en serio tomar una diferencia con el mercado (en puntos de probabilidad).
+    - recomendado: 3 a 10 puntos de ventaja
+    - revisar: más de 10; casi siempre es información que el modelo no tiene (bajas, rotaciones)
+    - leve: menos de 3"""
+    e = edge or 0.0
+    if e > 0.10:
+        return "revisar"
+    if e >= 0.03:
+        return "recomendado"
+    return "leve"
 
 
 @router.get("/today")
@@ -71,13 +115,10 @@ async def get_game_predictions(
     if game_date:
         target_date = date.fromisoformat(game_date)
     else:
-        # Default to today in US Eastern Time (GMT-4)
-        et_now = datetime.utcnow() - timedelta(hours=4)
-        target_date = et_now.date()
+        target_date = await current_slate_date(db, sport.upper() if sport else None)
 
     # 1. Get ALL games for the date using exact ET day boundaries in UTC
-    start_utc = datetime(target_date.year, target_date.month, target_date.day) + timedelta(hours=4)
-    end_utc = start_utc + timedelta(days=1)
+    start_utc, end_utc = et_bounds_utc(target_date)
     
     games_query = select(Game).where(
         and_(
@@ -100,6 +141,7 @@ async def get_game_predictions(
     if not games:
         return {
             "date": target_date.isoformat(),
+            "is_today": target_date == et_today(),
             "sport": sport.upper() if sport else "ALL",
             "count": 0,
             "games": [],
@@ -153,27 +195,7 @@ async def get_game_predictions(
         odds_list = odds_map.get(g.id, [])
         game_picks = picks_map.get(g.id, [])
 
-        # Build odds summary (best moneyline odds across sportsbooks)
-        odds_summary = None
-        if odds_list:
-            ml_odds = [o for o in odds_list if o.market == MarketType.MONEYLINE]
-            if ml_odds:
-                best_home = min(ml_odds, key=lambda o: abs(o.home_odds or 9999))
-                best_away = min(ml_odds, key=lambda o: abs(o.away_odds or 9999))
-                odds_summary = {
-                    "best_home_ml": {
-                        "odds": best_home.home_odds,
-                        "sportsbook": best_home.sportsbook,
-                    } if best_home.home_odds else None,
-                    "best_away_ml": {
-                        "odds": best_away.away_odds,
-                        "sportsbook": best_away.sportsbook,
-                    } if best_away.away_odds else None,
-                    "best_draw": {
-                        "odds": ml_odds[0].draw_odds,
-                        "sportsbook": ml_odds[0].sportsbook,
-                    } if ml_odds[0].draw_odds else None,
-                }
+        odds_summary = _odds_summary(odds_list)
 
         game_obj = {
             "id": g.id,
@@ -212,12 +234,17 @@ async def get_game_predictions(
                 "value_rating": pk.value_rating,
                 "best_odds": pk.best_odds,
                 "best_sportsbook": pk.best_sportsbook,
+                "market": pk.market.value if pk.market else None,
+                "model_probability": round(pk.model_probability, 4) if pk.model_probability is not None else None,
+                "implied_probability": round(pk.implied_probability, 4) if pk.implied_probability is not None else None,
+                "tier": pick_tier(pk.model_edge),
             } for pk in game_picks] if game_picks else [],
         }
         response_games.append(game_obj)
 
     return {
         "date": target_date.isoformat(),
+        "is_today": target_date == et_today(),
         "sport": sport.upper() if sport else "ALL",
         "count": len(response_games),
         "games": response_games,
@@ -239,16 +266,8 @@ async def get_value_picks(
         target_date = date.fromisoformat(game_date)
         query = query.where(Pick.game_date == target_date)
     else:
-        # Default to today in US Eastern Time (GMT-4) for betting slates
-        # This perfectly separates late US games from early morning international games
-        et_now = datetime.utcnow() - timedelta(hours=4)
-        local_today = et_now.date()
-        target_date = local_today 
-        
-        # Calculate the start and end of this ET day in UTC
-        # ET 00:00:00 -> UTC 04:00:00
-        start_utc = datetime(local_today.year, local_today.month, local_today.day) + timedelta(hours=4)
-        end_utc = start_utc + timedelta(days=1)
+        target_date = await current_slate_date(db)
+        start_utc, end_utc = et_bounds_utc(target_date)
         
         query = query.where(and_(Game.game_time >= start_utc, Game.game_time < end_utc))
 
@@ -324,8 +343,8 @@ async def get_value_picks(
 async def get_dashboard(
     db: AsyncSession = Depends(get_db),
 ):
-    """Dashboard summary: today's stats across all sports."""
-    today = date.today()
+    """Dashboard summary: today's stats across all sports (mismo día que la cartelera)."""
+    today = await current_slate_date(db)
 
     # Count picks by sport
     picks_query = select(
@@ -344,7 +363,8 @@ async def get_dashboard(
     games_query = select(
         Game.sport,
         func.count(Game.id).label("total"),
-    ).where(Game.game_date == today).group_by(Game.sport)
+    ).where(and_(Game.game_date == today, Game.status == GameStatus.SCHEDULED,
+                 Game.game_time > datetime.utcnow())).group_by(Game.sport)
 
     games_result = await db.execute(games_query)
     games_by_sport = {
@@ -382,8 +402,11 @@ async def get_dashboard(
     
     top_pick = None
     top_pick_game = None
+    # Destacado: la mejor diferencia "recomendada" (3-10 pts); las enormes suelen ser información que falta
     top_pick_result = await db.execute(
-        select(Pick).where(and_(Pick.game_date == today, Pick.expected_value > 0)).order_by(Pick.expected_value.desc()).limit(1)
+        select(Pick).where(and_(Pick.game_date == today, Pick.expected_value > 0,
+                                Pick.model_edge >= 0.03, Pick.model_edge <= 0.10))
+        .order_by(Pick.expected_value.desc()).limit(1)
     )
     tp = top_pick_result.scalar_one_or_none()
     if tp:
@@ -393,6 +416,7 @@ async def get_dashboard(
 
     return {
         "date": today.isoformat(),
+        "is_today": today == et_today(),
         "games_today": games_by_sport,
         "picks_today": picks_by_sport,
         "weekly_performance": performance,
@@ -404,6 +428,10 @@ async def get_dashboard(
             "expected_value": round(top_pick.expected_value, 4),
             "best_odds": top_pick.best_odds,
             "best_sportsbook": top_pick.best_sportsbook,
+            "model_edge": round(top_pick.model_edge, 4) if top_pick.model_edge is not None else None,
+            "model_probability": round(top_pick.model_probability, 4) if top_pick.model_probability is not None else None,
+            "implied_probability": round(top_pick.implied_probability, 4) if top_pick.implied_probability is not None else None,
+            "tier": pick_tier(top_pick.model_edge),
             "matchup": f"{top_pick_game.away_team_name} @ {top_pick_game.home_team_name}" if top_pick_game else "Desconocido"
         } if top_pick else None,
     }
@@ -474,3 +502,42 @@ async def get_nba_performance(
     from app.services.nba_tracking import performance, settle
     await settle(db)
     return await performance(db, days)
+
+
+
+def _dec(american: Optional[float]) -> float:
+    if american is None:
+        return 0.0
+    return 1.0 + (american / 100.0 if american > 0 else 100.0 / -american)
+
+
+def _odds_summary(odds_list) -> Optional[dict]:
+    """Mejor momio por lado (el que más paga), spread, total y favorito del mercado."""
+    if not odds_list:
+        return None
+    by_market = {}
+    for o in odds_list:
+        by_market.setdefault(o.market, []).append(o)
+    out = {"sportsbooks": sorted({o.sportsbook for o in odds_list}),
+           "updated_at": max(o.snapshot_time for o in odds_list).isoformat()}      # hora local del servidor (NOW() de MySQL)
+    ml = [o for o in by_market.get(MarketType.MONEYLINE, []) if o.home_odds is not None or o.away_odds is not None]
+    if ml:
+        bh = max((o for o in ml if o.home_odds is not None), key=lambda o: _dec(o.home_odds), default=None)
+        ba = max((o for o in ml if o.away_odds is not None), key=lambda o: _dec(o.away_odds), default=None)
+        bd = max((o for o in ml if o.draw_odds is not None), key=lambda o: _dec(o.draw_odds), default=None)
+        out["best_home_ml"] = {"odds": bh.home_odds, "sportsbook": bh.sportsbook} if bh else None
+        out["best_away_ml"] = {"odds": ba.away_odds, "sportsbook": ba.sportsbook} if ba else None
+        out["best_draw"] = {"odds": bd.draw_odds, "sportsbook": bd.sportsbook} if bd else None
+        if bh and ba:
+            out["market_favorite"] = "home" if _dec(bh.home_odds) < _dec(ba.away_odds) else "away"
+    sp = [o for o in by_market.get(MarketType.SPREAD, []) if o.spread_home is not None]
+    if sp:
+        o = next((x for x in sp if x.sportsbook == "DraftKings"), sp[0])
+        out["spread"] = {"home_line": o.spread_home, "home_odds": o.spread_home_odds, "away_odds": o.spread_away_odds,
+                         "sportsbook": o.sportsbook}
+        out.setdefault("market_favorite", "home" if o.spread_home < 0 else "away" if o.spread_home > 0 else None)
+    tt = [o for o in by_market.get(MarketType.OVER_UNDER, []) if o.total_line is not None]
+    if tt:
+        o = next((x for x in tt if x.sportsbook == "DraftKings"), tt[0])
+        out["total"] = {"line": o.total_line, "over_odds": o.over_odds, "under_odds": o.under_odds, "sportsbook": o.sportsbook}
+    return out
