@@ -290,6 +290,36 @@ En la app, "Por qué este pronóstico" muestra el estado de cada QB y notas como
   - Nota "64% de probabilidad de lluvia (pronóstico ESPN): el total baja ~2.2 pts".
   - En la NFL, las fichas Ganador/Spread/Total dicen "Se inclina por", en gris y con borde punteado: no son recomendaciones.
 
+### Más métricas (`ml/scripts/nfl_features_eval.py`)
+
+Se agregaron a la caché las pérdidas de balón por jugada y una tabla de equipos especiales por partido: EPA neto de patadas, despejes, goles de campo y puntos extra (`load_special_teams`). Se probaron estas métricas, cada una ajustada por rival y con descuento:
+- **epant:** EPA sin pérdidas de balón.
+- **succ:** tasa de éxito.
+- **st:** equipos especiales.
+- **QB en el total.**
+
+| Modelo | Error 2015–20 | Error 2021–26 | k contra la línea (15–20 / 21–26) |
+|---|---|---|---|
+| Margen actual | 9.975 | 10.082 | 0.30 / 0.00 |
+| + tasa de éxito | 9.977 | 10.072 | 0.29 / 0.00 |
+| + equipos especiales | 9.982 | 10.091 | 0.31 / 0.00 |
+| + las tres | 9.992 | 10.080 | 0.30 / 0.01 |
+| Total actual | 10.831 | 10.565 | 0.00 / 0.01 |
+| **+ QB titulares** | 10.781 | 10.462 | 0.00 / 0.11 |
+| **+ QB + EPA sin pérdidas (elegido)** | **10.776** | **10.430** | 0.00 / 0.18 |
+| Mercado | — | margen 9.738 · total 10.338 | — |
+
+**Qué dice:**
+- El margen no mejora con nada nuevo.
+- En el **total**, meter la calidad de los dos QB titulares y su cambio contra el habitual (`qb_sum`, `qb_adj_sum`), más el EPA sin pérdidas (`epant_total`), baja el error de 10.57 a **10.43**. Esto corrige justo los partidos con QB suplente: Rams–Cardinals 48.0 → 46.5 (línea 39.5) y Dolphins–Colts 45.0 → 43.1 (38.5).
+- En la mezcla de QB en duda, ahora también se promedian las variables del total.
+
+**Calibración:** antes usaba solo las últimas 4 temporadas, un corte duro que daba k = 0 y ponía todo en 50%. Ahora usa todas las temporadas fuera de muestra, con vida media de 3 temporadas (`CALIB_HALF_LIFE`):
+- k spread ≈ 0.05, k total ≈ 0.02, k ganador ≈ 1.09.
+- Las probabilidades contra la línea quedan en 49–51%. Es lo que dicen los datos: en 2015–2020 la diferencia con la línea sí predecía algo (k 0.30), y en 2021–2026 ya casi no.
+
+**El lado lo deciden las métricas:** con una probabilidad de exactamente 50%, `market_picks` elegía local u over por defecto. Ahora `nfl_picks` desempata con la diferencia del modelo contra la línea y devuelve `diff_pts`: cuántos puntos ve el modelo a favor de ese lado. En la app se ve como "El modelo ve 2.5 pts a favor de este lado respecto a la línea; en el backtest reciente esa diferencia casi no predijo el resultado".
+
 ### Rendimiento en vivo en la app
 
 - `GET /api/predictions/nfl/performance`: mismo formato que el de la NBA (`performance(db, days, sport="nfl")`):

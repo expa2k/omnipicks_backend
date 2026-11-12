@@ -65,7 +65,10 @@ def abbr(name: str) -> str:
 MARGIN_FEATURES = ["epa", "points", "qb_adj", "qb_raw"]
 # Lluvia: en el histórico resta ~3.4 pts y en esos partidos el error baja de 10.9 a 10.4.
 # La nieve (39 partidos) empeoraba el error, así que no entra.
-TOTAL_FEATURES = ["scoring", "epa_total", "pace", "indoor", "wind", "cold", "rain"]
+# QB en el total (calidad de los dos titulares y su cambio contra el habitual) y EPA sin pérdidas de
+# balón: error del total 2021–2026 de 10.57 a 10.43 (mercado 10.34). Ver ml/scripts/nfl_features_eval.py.
+TOTAL_FEATURES = ["scoring", "epa_total", "pace", "indoor", "wind", "cold", "rain", "qb_sum", "qb_adj_sum", "epant_total"]
+CALIB_HALF_LIFE = 3.0     # temporadas: la calibración contra la línea pesa más lo reciente
 
 
 class Features:
@@ -76,6 +79,7 @@ class Features:
         neutral = sched.filter(pl.col("location") == "Neutral")["game_id"].to_list()
         tg, qbg = team_games(pbp), qb_games(pbp)
         self.epa = NFLRatingEngine(tg, EPA_P, neutral_games=neutral)
+        self.epant = NFLRatingEngine(tg, EPA_P, neutral_games=neutral, value="epant")
         self.pts = PointsRatingEngine(played, PTS_P)
         self.score = ScoringRatingEngine(played, SCORE_P)
         self.qb = QBRatingEngine(qbg, QB_P)
@@ -106,13 +110,14 @@ class Features:
         key = (season, week)
         if key not in self._cache:
             self._cache[key] = (self.epa.at(season, week), self.pts.at(season, week, ridge=PTS_RIDGE),
-                                self.score.at(season, week, ridge=SCORE_RIDGE), self.qb.at(season, week))
+                                self.score.at(season, week, ridge=SCORE_RIDGE), self.qb.at(season, week),
+                                self.epant.at(season, week))
         return self._cache[key]
 
     def row(self, r: Dict) -> Tuple[Dict[str, float], Dict[str, float], Dict]:
         season, wk, home, away = r["season"], r["week"], r["home_team"], r["away_team"]
         neutral = r.get("location") == "Neutral"
-        we, (hfa, st), (mu_s, h_s, off_s, def_s), wq = self.week(season, wk)
+        we, (hfa, st), (mu_s, h_s, off_s, def_s), wq, wnt = self.week(season, wk)
         x_epa, x_te = expected_margin_epa(we, home, away, neutral)
         adj, raw = qb_margin_features(wq, home, away, r.get("home_qb_id"), r.get("away_qb_id"))
         m = {"epa": x_epa, "points": (0.0 if neutral else hfa) + st.get(home, 0.0) - st.get(away, 0.0),
@@ -133,7 +138,10 @@ class Features:
                         + off_s.get(away, 0) - def_s.get(home, 0),
              "epa_total": x_te, "pace": pace.get(home, lg) + pace.get(away, lg) - 2 * lg,
              "indoor": 1.0 if indoor else 0.0, "wind": max(0.0, wind - 10.0), "cold": max(0.0, 40.0 - temp),
-             "rain": rain, "snow": snow}
+             "rain": rain, "snow": snow,
+             "qb_sum": (wq.of(r.get("home_qb_id")) + wq.of(r.get("away_qb_id"))) * 38.0,
+             "qb_adj_sum": (wq.adjustment(home, r.get("home_qb_id")) + wq.adjustment(away, r.get("away_qb_id"))) * 38.0,
+             "epant_total": expected_margin_epa(wnt, home, away, neutral)[1]}
         info = {
             "home_net_epa": round(we.net(home), 3), "away_net_epa": round(we.net(away), 3),
             "home_points_rating": round(st.get(home, 0.0), 1), "away_points_rating": round(st.get(away, 0.0), 1),
@@ -161,8 +169,9 @@ def _fit(X: np.ndarray, y: np.ndarray) -> np.ndarray:
     return np.linalg.solve(A.T @ A + 1e-6 * np.eye(A.shape[1]), A.T @ y)
 
 
-def _calib_k(z: np.ndarray, y: np.ndarray) -> float:
-    nll = lambda k: -np.mean(y * np.log(norm.cdf(k * z) + 1e-12) + (1 - y) * np.log(1 - norm.cdf(k * z) + 1e-12))
+def _calib_k(z: np.ndarray, y: np.ndarray, w: Optional[np.ndarray] = None) -> float:
+    w = np.ones(len(z)) if w is None else w
+    nll = lambda k: -np.sum(w * (y * np.log(norm.cdf(k * z) + 1e-12) + (1 - y) * np.log(1 - norm.cdf(k * z) + 1e-12)))
     return float(minimize_scalar(nll, bounds=(0.0, 1.5), method="bounded").x)
 
 
@@ -223,15 +232,16 @@ def train(refresh: bool = True) -> Dict:
         if margin[i] != 0:
             zw.append(norm.ppf(np.clip(pr["home_win"], 1e-4, 1 - 1e-4)))
             yw.append(1.0 if margin[i] > 0 else 0.0)
-    # La calibración usa las últimas 4 temporadas: la del spread viene bajando año con año
+    # Calibración con todas las temporadas fuera de muestra, pesando más las recientes (vida media de
+    # CALIB_HALF_LIFE temporadas): el valor contra la línea viene bajando año con año.
     last = int(season[ok].max())
-    sel = lambda arr_s: np.array(arr_s) >= last - 3
+    wts = lambda arr_s: 0.5 ** ((last - np.array(arr_s)) / CALIB_HALF_LIFE)
     seasons_c = [season[i] for i in np.where(ok)[0] if margin[i] - spread[i] != 0]
     seasons_o = [season[i] for i in np.where(ok)[0] if not np.isnan(tline[i]) and total[i] != tline[i]]
     seasons_w = [season[i] for i in np.where(ok)[0] if margin[i] != 0]
-    k_cover = _calib_k(np.array(zc)[sel(seasons_c)], np.array(yc)[sel(seasons_c)])
-    k_over = _calib_k(np.array(zo)[sel(seasons_o)], np.array(yo)[sel(seasons_o)])
-    k_win = _calib_k(np.array(zw)[sel(seasons_w)], np.array(yw)[sel(seasons_w)])
+    k_cover = _calib_k(np.array(zc), np.array(yc), wts(seasons_c))
+    k_over = _calib_k(np.array(zo), np.array(yo), wts(seasons_o))
+    k_win = _calib_k(np.array(zw), np.array(yw), wts(seasons_w))
 
     cm, ct = _fit(Xm[use], margin[use]), _fit(Xt[use], total[use])
     try:
@@ -355,16 +365,19 @@ def _row_with_lineups(feats: Features, r: Dict, qbs, home: str, away: str):
         logger.warning(f"NFL v2: no se pudo revisar el QB de {away} @ {home} ({type(e).__name__}: {e})")
         return feats.row(r)
     m_avg: Dict[str, float] = defaultdict(float)
-    base = None
+    t_avg: Dict[str, float] = defaultdict(float)
+    info = None
     for hq, ph in lh["mix"]:
         for aq, pa in la["mix"]:
             r2 = {**r, "home_qb_id": hq, "away_qb_id": aq, "home_qb_name": None, "away_qb_name": None}
-            m, t, info = feats.row(r2)
+            m, t, inf = feats.row(r2)
             for k, v in m.items():
                 m_avg[k] += ph * pa * v
-            if base is None:
-                base = (t, info)
-    t, info = base
+            for k, v in t.items():
+                t_avg[k] += ph * pa * v
+            if info is None:
+                info = inf
+    t = dict(t_avg)
     for side, l in (("home", lh), ("away", la)):
         info[f"{side}_qb"].update({
             "name": l["starter_name"], "status": l["starter_status"], "play_prob": l["starter_prob"],
@@ -447,7 +460,17 @@ def nfl_picks(home_win_prob, pred_margin, pred_total, market_margin, market_tota
     probabilidades calibradas de la NFL. El ganador nunca se recomienda (sin ventaja en el backtest)."""
     from app.services.nba_tracking import market_picks
     pr = market_probs(pred_margin, pred_total, market_margin, market_total)
-    return market_picks(home_win_prob, pred_margin, pred_total, market_margin, market_total, ml_home, ml_away,
-                        sp_home_odds, sp_away_odds, over_odds, under_odds, home_pts, away_pts,
-                        abbr(home_name), abbr(away_name), p_home_cover=pr["home_cover"], p_over=pr["over"],
-                        winner_recommendable=False)
+    d_sp = None if pred_margin is None or market_margin is None else pred_margin - market_margin
+    d_tt = None if pred_total is None or market_total is None else pred_total - market_total
+    # El lado lo deciden las métricas (la diferencia con la línea), nunca un empate en 50%
+    tie = lambda p, d: p if p is None or d is None or abs(p - 0.5) > 1e-6 else 0.5 + (1e-6 if d > 0 else -1e-6 if d < 0 else 0)
+    out = market_picks(home_win_prob, pred_margin, pred_total, market_margin, market_total, ml_home, ml_away,
+                       sp_home_odds, sp_away_odds, over_odds, under_odds, home_pts, away_pts,
+                       abbr(home_name), abbr(away_name), p_home_cover=tie(pr["home_cover"], d_sp),
+                       p_over=tie(pr["over"], d_tt), winner_recommendable=False)
+    # Cuántos puntos ve el modelo a favor del lado elegido, contra la línea
+    if "spread" in out and d_sp is not None:
+        out["spread"]["diff_pts"] = round(d_sp if out["spread"]["side"] == "home" else -d_sp, 1)
+    if "total" in out and d_tt is not None:
+        out["total"]["diff_pts"] = round(d_tt if out["total"]["side"] == "over" else -d_tt, 1)
+    return out

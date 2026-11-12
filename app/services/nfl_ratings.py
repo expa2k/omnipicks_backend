@@ -65,7 +65,10 @@ def time_index(season: np.ndarray, week: np.ndarray, gap: float) -> np.ndarray:
 class NFLRatingEngine:
     """Ratings point-in-time a partir de la tabla de team_games (un renglón por equipo y partido)."""
 
-    def __init__(self, team_games: pl.DataFrame, params: RatingParams = RatingParams(), neutral_games=()):
+    def __init__(self, team_games: pl.DataFrame, params: RatingParams = RatingParams(), neutral_games=(),
+                 value: str = "epa"):
+        """value: qué se mide por jugada. "epa" (EPA), "epant" (EPA sin pérdidas de balón) o
+        "succ" (tasa de éxito)."""
         self.p = params
         tg = team_games
         self.teams: List[str] = sorted(set(tg["posteam"].to_list()) | set(tg["defteam"].to_list()))
@@ -78,7 +81,7 @@ class NFLRatingEngine:
         neutral = set(neutral_games)
         self.home = np.array([0.0 if g in neutral else float(h)
                               for g, h in zip(tg["game_id"].to_list(), tg["is_home"].to_list())])
-        self.epa = {k: tg[f"epa_{k}"].to_numpy() for k in KINDS}
+        self.epa = {k: tg[f"{value}_{k}"].to_numpy() for k in KINDS}
         self.n = {k: tg[f"n_{k}"].to_numpy() for k in KINDS}
 
     def at(self, season: int, week: int) -> WeekRatings:

@@ -23,7 +23,9 @@ PBP_COLUMNS = [
     "passer_player_id", "passer_player_name", "cpoe", "qb_epa",
     "id", "name", "qb_scramble", "sack",      # id/name: el QB del dropback (también en scrambles y sacks)
     "weather", "roof",                        # clima observado ("Light Snow Temp: 36° F…") y techo
+    "interception", "fumble_lost",            # pérdidas de balón (para el EPA sin pérdidas)
 ]
+ST_PLAYS = ("kickoff", "punt", "field_goal", "extra_point")
 
 
 def current_season(today: date = None) -> int:
@@ -34,6 +36,10 @@ def current_season(today: date = None) -> int:
 
 def _pbp_path(season: int) -> str:
     return os.path.join(CACHE_DIR, f"pbp_{season}.parquet")
+
+
+def _st_path(season: int) -> str:
+    return os.path.join(CACHE_DIR, f"st_{season}.parquet")
 
 
 def load_pbp(seasons: Iterable[int], refresh_current: bool = False) -> pl.DataFrame:
@@ -47,11 +53,16 @@ def load_pbp(seasons: Iterable[int], refresh_current: bool = False) -> pl.DataFr
         path = _pbp_path(season)
         if os.path.exists(path) and not (refresh_current and season == cur):
             cached = pl.read_parquet(path)
-            if all(c in cached.columns for c in ("id", "name", "weather")):     # caché con las columnas de hoy
+            if all(c in cached.columns for c in ("id", "name", "weather", "fumble_lost")) \
+                    and os.path.exists(_st_path(season)):                         # caché con las columnas de hoy
                 frames.append(cached)
                 continue
         logger.info(f"NFL: descargando jugadas de {season}")
         df = nfl.load_pbp([season])
+        # Equipos especiales: EPA de cada patada desde el lado del equipo con el balón
+        st = df.filter(pl.col("play_type").is_in(ST_PLAYS) & pl.col("epa").is_not_null() & pl.col("posteam").is_not_null())
+        st.group_by(["game_id", "season", "week", "posteam", "defteam"]).agg(epa=pl.col("epa").sum(), n=pl.len()) \
+          .write_parquet(_st_path(season))
         df = df.select([c for c in PBP_COLUMNS if c in df.columns])
         df = df.filter(pl.col("play_type").is_in(["pass", "run"]) & pl.col("epa").is_not_null()
                        & pl.col("posteam").is_not_null())
@@ -80,6 +91,20 @@ def normalize_teams(df: pl.DataFrame, cols=("posteam", "defteam", "home_team", "
     return df.with_columns([pl.col(c).replace(RELOCATED) for c in cols if c in df.columns])
 
 
+def load_special_teams(seasons: Iterable[int]) -> pl.DataFrame:
+    """Un renglón por equipo y partido: EPA neto de equipos especiales (a favor − en contra).
+    Requiere que load_pbp haya bajado esas temporadas."""
+    frames = [pl.read_parquet(_st_path(s)) for s in seasons if os.path.exists(_st_path(s))]
+    if not frames:
+        return pl.DataFrame()
+    st = normalize_teams(pl.concat(frames, how="diagonal_relaxed"), cols=("posteam", "defteam"))
+    own = st.select("game_id", "season", "week", pl.col("posteam").alias("team"), pl.col("epa").alias("for"))
+    opp = st.select("game_id", pl.col("defteam").alias("team"), pl.col("epa").alias("against"))
+    out = own.group_by(["game_id", "season", "week", "team"]).agg(pl.col("for").sum()).join(
+        opp.group_by(["game_id", "team"]).agg(pl.col("against").sum()), on=["game_id", "team"], how="full", coalesce=True)
+    return out.with_columns(st_net=pl.col("for").fill_null(0) - pl.col("against").fill_null(0))
+
+
 def team_games(pbp: pl.DataFrame, wp_lo: float = 0.05, wp_hi: float = 0.95) -> pl.DataFrame:
     """Un renglón por equipo y partido: EPA por jugada de su ataque, en pase y en carrera.
 
@@ -89,11 +114,15 @@ def team_games(pbp: pl.DataFrame, wp_lo: float = 0.05, wp_hi: float = 0.95) -> p
     plays = pbp.filter(pl.col("wp").is_between(wp_lo, wp_hi) & (pl.col("half_seconds_remaining") > 120))
     plays = plays.with_columns(
         kind=pl.when(pl.col("qb_dropback") == 1).then(pl.lit("pass")).otherwise(pl.lit("rush")))
+    to = (pl.col("interception").fill_null(0) + pl.col("fumble_lost").fill_null(0)) > 0 \
+        if "fumble_lost" in plays.columns else pl.lit(False)
     agg = plays.group_by(["game_id", "season", "week", "game_date", "posteam", "defteam", "home_team", "kind"]).agg(
-        epa=pl.col("epa").sum(), n=pl.len(), success=pl.col("success").mean())
+        epa=pl.col("epa").sum(), n=pl.len(), success=pl.col("success").mean(),
+        epant=pl.when(to).then(0.0).otherwise(pl.col("epa")).sum(),       # EPA sin pérdidas de balón
+        succ=pl.col("success").fill_null(0).sum())
     wide = agg.pivot(on="kind", index=["game_id", "season", "week", "game_date", "posteam", "defteam", "home_team"],
-                     values=["epa", "n", "success"])
-    vals = [c for c in wide.columns if c.split("_")[0] in ("epa", "n", "success")]
+                     values=["epa", "n", "success", "epant", "succ"])
+    vals = [c for c in wide.columns if c.split("_")[0] in ("epa", "n", "success", "epant", "succ")]
     wide = wide.with_columns([pl.col(c).fill_null(0.0) for c in vals]).with_columns(
         is_home=(pl.col("posteam") == pl.col("home_team")).cast(pl.Int8),
         n=pl.col("n_pass") + pl.col("n_rush"),
