@@ -262,7 +262,7 @@ Falta de N2: calibrar la probabilidad de jugar con el historial de reportes (nec
 | 🟠 | Pipeline y cuota | ✅ ya hay flag `RUN_PIPELINE_ON_STARTUP`. Falta el endpoint para correrlo a mano, quitar `btts` (−9 requests por corrida), no duplicar predicciones en los otros deportes (NBA ya no duplica) y apagar el eco de SQL |
 | 🟠 | Liquidación de picks | Llenar `result` y `profit_loss`; es la base para medir el ROI y el rendimiento |
 | 🟠 | Fútbol | Aplicar la corrección de ESPN (al menos 5 partidos y que traiga goles; **falta que me pases el código**), correr `diag_espn_cl.py` (**también falta**) y usar Dixon-Coles + ClubElo |
-| 🟠 | NFL | ✅ Fechas reales, carga cada hora desde ESPN con líneas de DraftKings y nombres de equipo corregidos. Modelo nuevo en curso: fases 0 y 1 listas (ver `PLAN_NFL.md`); falta el QB, el contexto, el backtest y pasarlo a producción |
+| 🟠 | NFL | ✅ Fechas reales, carga cada hora desde ESPN con líneas de DraftKings y nombres de equipo corregidos. Modelo nuevo en curso: fases 0, 1 y 2 (QB) listas (ver `PLAN_NFL.md`); falta el contexto, el backtest y pasarlo a producción |
 | 🟡 | Picks de valor | Emparejar equipos por alias (no por los primeros 4 caracteres), elegir bien la "mejor cuota", calcular una confianza real |
 | 🟡 | Zona horaria | UTC−4 fijo en el código (en noviembre ET es UTC−5) |
 

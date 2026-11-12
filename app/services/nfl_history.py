@@ -21,6 +21,7 @@ PBP_COLUMNS = [
     "game_id", "season", "week", "season_type", "game_date", "posteam", "defteam", "home_team", "away_team",
     "play_type", "pass", "rush", "qb_dropback", "epa", "success", "wp", "down", "half_seconds_remaining",
     "passer_player_id", "passer_player_name", "cpoe", "qb_epa",
+    "id", "name", "qb_scramble", "sack",      # id/name: el QB del dropback (también en scrambles y sacks)
 ]
 
 
@@ -44,8 +45,10 @@ def load_pbp(seasons: Iterable[int], refresh_current: bool = False) -> pl.DataFr
     for season in seasons:
         path = _pbp_path(season)
         if os.path.exists(path) and not (refresh_current and season == cur):
-            frames.append(pl.read_parquet(path))
-            continue
+            cached = pl.read_parquet(path)
+            if all(c in cached.columns for c in ("id", "name")):     # caché con las columnas de hoy
+                frames.append(cached)
+                continue
         logger.info(f"NFL: descargando jugadas de {season}")
         df = nfl.load_pbp([season])
         df = df.select([c for c in PBP_COLUMNS if c in df.columns])
