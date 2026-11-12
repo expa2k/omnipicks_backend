@@ -479,6 +479,9 @@ class DataIngestionService:
             self.db.add(team)
             await self.db.flush()
         else:
+            if sport in (SportType.NFL, SportType.NBA) and name and name != "Unknown" and team.name != name:
+                logger.info(f"Equipo {sport.value} {external_id}: nombre corregido '{team.name}' → '{name}'")
+                team.name = name
             for k, v in kwargs.items():
                 if v is not None:
                     setattr(team, k, v)
@@ -502,6 +505,8 @@ class DataIngestionService:
             )
             self.db.add(game)
         else:
+            game.home_team_id, game.away_team_id = home_team.id, away_team.id
+            game.home_team_name, game.away_team_name = home_team.name, away_team.name
             for k, v in kwargs.items():
                 if v is not None:
                     if k == "raw_data" and isinstance(game.raw_data, dict) and isinstance(v, dict):
