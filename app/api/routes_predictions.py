@@ -194,8 +194,11 @@ async def get_game_predictions(
 
     # Lo que recomendó el modelo antes del partido (registro congelado), para los ya empezados
     from app.db_models import NBAPredictionLog
-    logs = {r.game_id: r for r in (await db.execute(select(NBAPredictionLog).where(and_(
-        NBAPredictionLog.game_id.in_(game_ids), NBAPredictionLog.model_name == "nba_players_v2")))).scalars().all()}
+    logs, late_logs = {}, {}
+    for r in (await db.execute(select(NBAPredictionLog).where(and_(
+            NBAPredictionLog.game_id.in_(game_ids),
+            NBAPredictionLog.model_name.in_(["nba_players_v2", "nba_players_v2_tardia"]))))).scalars().all():
+        (logs if r.model_name == "nba_players_v2" else late_logs)[r.game_id] = r
 
     # Logos (los manda ESPN; se guardan en la tabla de equipos)
     from app.db_models import Team
@@ -226,6 +229,12 @@ async def get_game_predictions(
             "away_logo": logos.get(g.away_team_id) or None,
             "result": _result(g, pred, _frozen(g, logs.get(g.id))),
             "model_picks": _model_picks(g, pred, odds_summary, logs.get(g.id)),
+            "late_prediction": ({
+                "home_win_prob": round(late_logs[g.id].home_win_prob, 4),
+                "predicted_spread": round(-late_logs[g.id].pred_margin, 1),
+                "predicted_total": late_logs[g.id].pred_total,
+                "minutes_after_tip": None if late_logs[g.id].minutes_before_tip is None else round(-late_logs[g.id].minutes_before_tip),
+            } if g.id in late_logs else None),
             "lineups": g.raw_data.get("lineups") if g.raw_data and isinstance(g.raw_data, dict) else None,
             # Prediction (protagonist)
             "prediction": {

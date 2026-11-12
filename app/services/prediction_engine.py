@@ -30,6 +30,25 @@ class PredictionEngine:
         self.bzzoiro = BzzoiroClient()
         self.meta_model = SoccerMetaModel(self.db)
 
+    async def _log_late_nba(self, target_date: date, games):
+        """Predicción "tardía" de partidos NBA ya empezados: solo como referencia (no cuenta en el
+        historial ni cambia la predicción previa). Sirve para ver cuánto cambia el modelo con las
+        bajas finales. Ojo: el reporte de lesiones puede traer algo que pasó ya en el partido."""
+        if not games or os.getenv("NBA_MODEL", "v2").lower() == "v1":
+            return
+        from app.services.nba_tracking import log_late_prediction
+        from app.services.nba_v2 import predict_games_sync
+        try:
+            late = await asyncio.to_thread(predict_games_sync, target_date,
+                                           [(g.id, g.home_team_name, g.away_team_name) for g in games])
+            for g in games:
+                if g.id in late:
+                    await log_late_prediction(self.db, g, late[g.id])
+            await self.db.commit()
+            logger.info(f"NBA: predicción tardía (referencia) de {len(late)} partidos en juego")
+        except Exception as e:
+            logger.warning(f"NBA: no se pudo guardar la predicción tardía ({type(e).__name__}: {e})")
+
     async def run_predictions_for_date(self, target_date: date, sports: Optional[List[SportType]] = None):
         """Run ML predictions for the games on a specific date.
         `sports` limita la corrida a ciertos deportes (None = todos)."""
@@ -50,6 +69,8 @@ class PredictionEngine:
                    or (g.game_time is not None and g.game_time <= now)]
         if started:
             logger.info(f"{len(started)} partidos ya empezaron: se conserva su predicción previa")
+            await self._log_late_nba(target_date, [g for g in started if g.sport == SportType.NBA
+                                                    and g.status != GameStatus.FINISHED])
         games = [g for g in games if g not in started]
         if not games:
             return

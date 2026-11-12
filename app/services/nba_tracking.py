@@ -189,6 +189,26 @@ async def log_prediction(db: AsyncSession, game: Game, model_name: str, pred: Di
     await db.execute(stmt.on_duplicate_key_update(**update))
 
 
+LATE_MODEL = "nba_players_v2_tardia"
+
+
+async def log_late_prediction(db: AsyncSession, game: Game, pred: Dict):
+    """Guarda (o actualiza) la predicción hecha con el partido ya empezado. Solo referencia."""
+    if game.status == GameStatus.FINISHED:
+        return
+    now = _utcnow()
+    row = {
+        "game_id": game.id, "model_name": LATE_MODEL, "game_date": game.game_date, "game_time": game.game_time,
+        "home_team": game.home_team_name, "away_team": game.away_team_name, "predicted_at": now,
+        "minutes_before_tip": None if game.game_time is None else round((game.game_time - now).total_seconds() / 60.0, 1),
+        "home_win_prob": float(pred["home_win_prob"]),
+        "pred_margin": -float(pred["predicted_spread"]) if pred.get("predicted_spread") is not None else 0.0,
+        "pred_total": pred.get("predicted_total"),
+    }
+    stmt = mysql_insert(NBAPredictionLog).values(row)
+    await db.execute(stmt.on_duplicate_key_update(**{k: stmt.inserted[k] for k in row if k not in ("game_id", "model_name")}))
+
+
 async def settle(db: AsyncSession) -> int:
     """Llena el marcador de las predicciones cuyos partidos ya terminaron."""
     from app.services.nba_lineups import team_ids_by_name

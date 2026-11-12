@@ -228,6 +228,12 @@ class NBAv2Predictor:
         self.pace.new_season(self.season)
 
         self.tracker, self.names = load_tracker(self.engine, day)
+        try:
+            from app.services.nba_props import load_history
+            self.prop_rates, self.prop_last10 = load_history(self.engine, day)
+        except Exception as e:
+            logger.warning(f"NBA v2: sin proyecciones por jugador ({type(e).__name__}: {e})")
+            self.prop_rates = None
         self.injuries: Dict[int, List[Dict]] = {}
         for team_name, grp in inj.groupby("team_name"):
             tid = self.team_id.get(team_name.lower())
@@ -341,6 +347,29 @@ class NBAv2Predictor:
                 })
         injuries.sort(key=lambda x: x["impact_if_out"])
 
+        # Proyección por jugador (puntos, rebotes, asistencias, triples) con los minutos esperados de hoy
+        projections = {}
+        if self.prop_rates is not None:
+            from app.services.nba_props import project_player
+            pace_factor = (pace_h + pace_a) / 2.0 / lp
+            for side, T in (("home", H), ("away", A)):
+                m_today = T.minutes(T.probs)
+                usual = T.minutes({p: 1.0 for p in T.probs})
+                rows = []
+                for i in np.argsort(-m_today):
+                    p0 = T.probs.get(T.ids[i], 1.0)
+                    if m_today[i] < 8 and not (0.0 < p0 < 1.0 and m_today[i] >= 3):
+                        continue
+                    pid = T.ids[i]
+                    p_play = T.probs.get(pid, 1.0)
+                    m_i = float(m_today[i])
+                    if 0.0 < p_play < 1.0:                  # en duda: proyección si juega
+                        m_i = float(T.minutes({**T.probs, pid: 1.0})[i])
+                    proj = project_player(self.prop_rates, self.prop_last10, pid, m_i, float(usual[i]), pace_factor)
+                    rows.append({"player": self.names.get(pid, str(pid)), "position": self.position.get(pid),
+                                 "play_probability": p_play, **proj})
+                projections[side] = rows
+
         hw = sim["home_win_prob"]
         return {
             "home_win_prob": round(hw, 4), "away_win_prob": round(1.0 - hw, 4), "draw_prob": 0.0,
@@ -360,6 +389,7 @@ class NBAv2Predictor:
                 "minutes_model": "lightgbm" if self.minutes_model else "proporcional",
                 "teams": teams,
                 "injuries": injuries,
+                "player_projections": projections,
             },
         }
 
