@@ -504,6 +504,12 @@ class NBAPredictionLog(Base):
     market_margin = Column(Float, nullable=True)               # −spread del local (ESPN/DraftKings)
     market_total = Column(Float, nullable=True)
     market_provider = Column(String(50), nullable=True)
+    ml_home = Column(Float, nullable=True)                     # momios americanos al momento de predecir
+    ml_away = Column(Float, nullable=True)
+    spread_home_odds = Column(Float, nullable=True)
+    spread_away_odds = Column(Float, nullable=True)
+    over_odds = Column(Float, nullable=True)
+    under_odds = Column(Float, nullable=True)
     home_pts = Column(Integer, nullable=True)
     away_pts = Column(Integer, nullable=True)
     settled_at = Column(DateTime, nullable=True)
