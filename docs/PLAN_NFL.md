@@ -11,7 +11,7 @@ Hoy la predicción de la NFL es un relleno: el simulador usa `wind_speed` y `qb_
 | 0 | Datos de nflverse: jugadas con EPA desde 2010, calendario con resultados, descanso, techo, clima, QB titular y líneas de cierre | ✅ |
 | 1 | Rating de cada equipo: ataque y defensa en pase y en carrera, ajustados por rival, más un rating por marcador | ✅ |
 | 2 | QB: rating propio de cada QB y cambio del titular cuando no juega | ✅ |
-| 3 | Contexto: localía, descanso (bye, jueves), viaje y husos horarios, viento y frío | pendiente |
+| 3 | Contexto: localía, descanso (bye, jueves), viaje y husos horarios, división | ✅ probado, no mejora el margen |
 | 4 | De ratings a marcador: margen y total, con la distribución real del margen (números clave 3 y 7) | pendiente |
 | 5 | Backtest completo semana a semana, contra el Elo y la línea de cierre (incluye % de spreads cubiertos) | pendiente |
 | 6 | Producción: tareas semanales, predicción congelada, liquidación, historial y front | pendiente |
@@ -88,3 +88,43 @@ Error medio del margen, en puntos. Con el QB, el Brier de la prueba limpia baja 
 - En 2015–2020 el modelo queda a 0.13 puntos del mercado; en 2021–2026, a 0.34. El mercado mejoró en los últimos años y nosotros no tanto. Falta el contexto (fase 3) y la conversión a marcador (fase 4).
 - Vidas medias más largas (128–256 semanas) mejoraban 2015–2020, pero empeoraban la prueba limpia, así que se quedó en 64.
 - Ideas que quedan: ajustar el EPA del QB por la defensa rival y usar el % de pases completos sobre lo esperado (CPOE).
+
+## Fase 3: contexto del partido
+
+`app/services/nfl_context.py`: variables que se saben antes del partido, todas del lado del local.
+- Localía (0 en sede neutral).
+- Diferencia de descanso, semana libre (bye) y semana corta (jueves) de cada equipo.
+- Kilómetros de viaje del visitante, husos horarios que cruzó y si juega antes de las 11 a. m. de su reloj (un equipo del oeste a la 1 p. m. ET).
+- Partido divisional, 2020 sin público y playoffs.
+- Considera los estadios anteriores de Raiders (Oakland), Chargers (San Diego) y Rams (St. Louis).
+
+### Resultado (`ml/scripts/nfl_context_eval.py`)
+
+| Modelo | 2015–2020 | 2021–2026 (prueba limpia) |
+|---|---|---|
+| Fase 2 (EPA + marcador + QB) | 9.98 | 10.08 |
+| Fase 3: + contexto | 9.98 | 10.08 |
+| Mercado | 9.85 | 9.74 |
+
+**El contexto no mejora el margen.** Los efectos son chicos, de 0.1 a 0.7 puntos, y ruidosos: por ejemplo, la semana libre sale negativa para los dos equipos. Además, la localía ya está dentro de los ratings: tanto el de EPA como el de marcador aprenden su propio término de local, que se va ajustando con los años. Dar más peso a las temporadas recientes al convertir a puntos tampoco ayudó.
+
+**Decisión:** el margen se queda con la fase 2. El módulo se queda para la fase 4, donde el clima (viento y frío) sí debería pesar en el total.
+
+### Dónde está la distancia con el mercado
+
+Error medio del modelo de la fase 2 contra la línea de cierre, de 2015 a 2026:
+
+| Semanas | Partidos | Modelo | Mercado | Diferencia |
+|---|---|---|---|---|
+| 1–4 | 762 | 10.00 | 9.85 | +0.15 |
+| 5–9 | 854 | 9.97 | 9.73 | +0.24 |
+| 10–14 | 808 | 10.01 | 9.77 | +0.24 |
+| 15–18 | 633 | 10.15 | 9.86 | +0.29 |
+| Playoffs | 107 | 10.13 | 9.69 | +0.44 |
+
+La distancia es pareja todo el año, así que no es un problema del arranque de temporada. Es información de la semana que el mercado tiene y el modelo no:
+- lesiones fuera del QB;
+- titulares que descansan al final de la temporada;
+- equipos ya clasificados o eliminados.
+
+Ideas para después de la fase 4: bajas por grupo de posición (línea ofensiva, receptores, secundaria), con las que el backtest diga que ayudan, y una marca para "ya clasificado o eliminado" en las semanas 17–18.
