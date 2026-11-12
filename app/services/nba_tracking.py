@@ -91,11 +91,15 @@ def market_picks(home_win_prob: float, pred_margin: Optional[float], pred_total:
                  market_margin: Optional[float], market_total: Optional[float],
                  ml_home=None, ml_away=None, sp_home_odds=None, sp_away_odds=None, over_odds=None, under_odds=None,
                  home_pts: Optional[int] = None, away_pts: Optional[int] = None,
-                 home_abbr: str = "LOC", away_abbr: str = "VIS") -> Dict:
+                 home_abbr: str = "LOC", away_abbr: str = "VIS",
+                 p_home_cover: Optional[float] = None, p_over: Optional[float] = None,
+                 winner_recommendable: bool = True) -> Dict:
     """Lado que prefiere el modelo en cada mercado, con su probabilidad, la del casino y el valor.
 
     Si se dan los puntos finales, marca el resultado: "win", "loss" o "push".
     El spread se expresa como en el casino: "TOR +10.5" (línea del lado elegido).
+    p_home_cover / p_over: probabilidades ya calculadas (NFL: con números clave y calibradas);
+    si no vienen, se usa la normal de la NBA. winner_recommendable=False deja el ganador sin valor.
     """
     sd_m, sd_t = _sigmas()
     done = home_pts is not None and away_pts is not None
@@ -109,12 +113,13 @@ def market_picks(home_win_prob: float, pred_margin: Optional[float], pred_total:
     imp = _implied(price)
     out["winner"] = {"side": side, "label": home_abbr if side == "home" else away_abbr, "prob": round(prob, 3),
                      "odds": price, "implied": None if imp is None else round(imp, 3),
-                     "edge": None if imp is None else round(prob - imp, 3), "tier": pick_tier(None if imp is None else prob - imp),
+                     "edge": None if imp is None else round(prob - imp, 3),
+                     "tier": pick_tier(None if imp is None else prob - imp) if winner_recommendable or imp is None else "sin_valor",
                      "result": None if not done else ("win" if (margin > 0) == (side == "home") and margin != 0 else "loss")}
 
     # Spread: el local cubre si margen + línea_local > 0 (línea_local = −market_margin)
     if pred_margin is not None and market_margin is not None:
-        p_home = _ncdf((pred_margin - market_margin) / sd_m)
+        p_home = p_home_cover if p_home_cover is not None else _ncdf((pred_margin - market_margin) / sd_m)
         side = "home" if p_home >= 0.5 else "away"
         prob = p_home if side == "home" else 1.0 - p_home
         line_home = -market_margin
@@ -133,7 +138,7 @@ def market_picks(home_win_prob: float, pred_margin: Optional[float], pred_total:
 
     # Total
     if pred_total is not None and market_total is not None:
-        p_over = 1.0 - _ncdf((market_total - pred_total) / sd_t)
+        p_over = p_over if p_over is not None else 1.0 - _ncdf((market_total - pred_total) / sd_t)
         side = "over" if p_over >= 0.5 else "under"
         prob = p_over if side == "over" else 1.0 - p_over
         price = over_odds if side == "over" else under_odds

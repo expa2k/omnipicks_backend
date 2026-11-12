@@ -1,6 +1,6 @@
 # OmniPicks: plan del modelo NFL
 
-Hoy la predicción de la NFL es un relleno: el simulador usa `wind_speed` y `qb_diff`, que nadie calcula, así que siempre da **local por 2.5 y total de 45**. El objetivo es cambiarlo por un modelo que use datos reales, construido igual que el de la NBA.
+Antes, la predicción de la NFL era un relleno: el simulador usa `wind_speed` y `qb_diff`, que nadie calcula, así que siempre daba **local por 2.5 y total de 45**. Desde la fase 6 la app usa `nfl_v2`. El objetivo era cambiarlo por un modelo que use datos reales, construido igual que el de la NBA.
 
 **Regla:** el mercado no entra al modelo. La línea de cierre solo sirve para compararse.
 
@@ -14,7 +14,7 @@ Hoy la predicción de la NFL es un relleno: el simulador usa `wind_speed` y `qb_
 | 3 | Contexto: localía, descanso (bye, jueves), viaje y husos horarios, división | ✅ probado, no mejora el margen |
 | 4 | De ratings a marcador: margen y total, con la distribución real del margen (números clave 3 y 7) | ✅ |
 | 5 | Backtest de apuestas semana a semana con momios reales de cierre | ✅ sin ventaja |
-| 6 | Producción: tareas semanales, predicción congelada, liquidación, historial y front | pendiente |
+| 6 | Producción: tareas semanales, predicción congelada, liquidación, historial y front | ✅ |
 
 ## Fase 0: datos
 
@@ -213,3 +213,41 @@ En 2017–2020 algunas reglas salen positivas, como el spread con diferencia ≥
 - El valor contra el casino, con la probabilidad calibrada. En la práctica casi todo saldrá "sin valor".
 - No recomendar moneyline con la probabilidad del modelo.
 - Guardar las líneas de apertura de ESPN para, más adelante, medir si hay ventaja antes de que la línea se mueva. Ahí es donde suele estar, si es que hay.
+
+## Fase 6: producción
+
+`app/services/nfl_v2.py`:
+- **`train()`**: baja la temporada actual de nflverse, recorre todo el histórico semana a semana como el backtest (~15 s) y guarda en `ml/saved_models/nfl_v2.json`:
+  - los coeficientes del margen y del total;
+  - σ del margen y del total;
+  - los pesos de los números clave;
+  - la calibración `k` de spread, total y ganador, ajustada con las últimas 4 temporadas.
+
+  Ese archivo no se versiona porque cambia cada día. Se reentrena solo cuando tiene más de 20 h.
+- **`predict_games_sync()`**:
+  - Empareja cada partido de la base (nombres de ESPN) con el de nflverse por abreviatura y fecha (±1 día).
+  - **Vuelve a bajar el calendario en cada corrida**, para tomar los QB titulares actualizados.
+  - Devuelve probabilidad, marcador, margen y total, y en `simulation_details` los QB (rating, dropbacks, ajuste), los ratings, la localía, el clima y la calibración.
+- **`market_probs` / `nfl_picks`**: lo que prefiere el modelo en cada mercado, con el mismo formato que la NBA, pero con números clave y probabilidades calibradas. **El ganador nunca se recomienda.**
+
+**Conexiones:**
+- `prediction_engine`:
+  - La NFL usa `nfl_v2`; si falla, queda el simulador viejo (`NFL_MODEL=v1` lo fuerza).
+  - La predicción se congela antes del partido en `nba_prediction_log` con `model_name = "nfl_v2"`. La tabla es compartida; la liquidación es la misma (marcador final de ESPN).
+  - Los picks de la NFL solo salen de spread o total con nivel "recomendado", nunca de moneyline. Con la calibración actual no habrá casi ninguno.
+- `routes_predictions`: `model_picks`, la predicción congelada y el resultado funcionan para la NFL igual que para la NBA.
+- **Scheduler:** `job_nfl` cada hora (ESPN: partidos, marcadores y líneas → predicciones). El reentrenamiento diario va dentro de la predicción.
+- **Front** (tarjeta del partido):
+  - "Por qué este pronóstico" con los QB titulares, su rating, el cambio contra su QB habitual, los ratings de EPA y de marcador, la localía y el clima.
+  - "Rango del pronóstico" (80%).
+  - Una nota de que en la NFL el modelo es para pronosticar, no para apostar.
+- **Logos:** el scoreboard de ESPN trae `logo` (no `logos`); se llenaron los 32.
+
+**Primer entrenamiento (12-nov-2026, hasta la semana 9):** 3,698 partidos fuera de muestra, MAE del margen 10.09 (mercado 9.90), acierto de ganador 65.4%. `k` spread = 0.00, `k` total = 0.00, `k` ganador = 1.05.
+
+Con las últimas 4 temporadas, la diferencia con la línea no predijo nada, así que el spread y el total salen en 50% ("sin valor"). La app muestra hacia dónde se inclina el modelo, sin recomendarlo.
+
+**Pendiente:**
+- Revisar el QB titular con las lesiones de ESPN (hoy sale del calendario de nflverse, que publica titulares proyectados).
+- Guardar las líneas de apertura para medir si hay ventaja antes de que la línea se mueva.
+- Bajas por grupo de posición.

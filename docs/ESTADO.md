@@ -262,7 +262,7 @@ Falta de N2: calibrar la probabilidad de jugar con el historial de reportes (nec
 | 🟠 | Pipeline y cuota | ✅ ya hay flag `RUN_PIPELINE_ON_STARTUP`. Falta el endpoint para correrlo a mano, quitar `btts` (−9 requests por corrida), no duplicar predicciones en los otros deportes (NBA ya no duplica) y apagar el eco de SQL |
 | 🟠 | Liquidación de picks | Llenar `result` y `profit_loss`; es la base para medir el ROI y el rendimiento |
 | 🟠 | Fútbol | Aplicar la corrección de ESPN (al menos 5 partidos y que traiga goles; **falta que me pases el código**), correr `diag_espn_cl.py` (**también falta**) y usar Dixon-Coles + ClubElo |
-| 🟠 | NFL | ✅ Fechas reales, carga cada hora desde ESPN con líneas de DraftKings y nombres de equipo corregidos. Modelo nuevo en curso: fases 0, 1, 2 (QB) y 3 (contexto, sin mejora) y 4 (total y números clave) listas (ver `PLAN_NFL.md`). Fase 5 (backtest de apuestas con momios reales): sin ventaja en spread, total ni ganador. Falta pasarlo a producción (fase 6) |
+| 🟠 | NFL | ✅ Fechas reales, carga cada hora desde ESPN con líneas de DraftKings y nombres de equipo corregidos. Modelo nuevo en curso: fases 0, 1, 2 (QB) y 3 (contexto, sin mejora) y 4 (total y números clave) listas (ver `PLAN_NFL.md`). Fase 5 (backtest con momios reales): sin ventaja en spread, total ni ganador. **Fase 6: en producción (`nfl_v2`)**, pronóstico con QB titular, predicción congelada, liquidación y front; recomienda casi nada (calibrado). Pendiente: QB con lesiones de ESPN y líneas de apertura |
 | 🟡 | Picks de valor | Emparejar equipos por alias (no por los primeros 4 caracteres), elegir bien la "mejor cuota", calcular una confianza real |
 | 🟡 | Zona horaria | UTC−4 fijo en el código (en noviembre ET es UTC−5) |
 

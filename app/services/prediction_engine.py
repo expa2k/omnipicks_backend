@@ -6,7 +6,7 @@ import asyncio
 import logging
 import os
 from datetime import date
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -74,6 +74,20 @@ class PredictionEngine:
             await self.db.execute(delete(Prediction).where(Prediction.game_id.in_([g.id for g in nba_games])))
             await self.db.flush()
         
+        # NFL v2 (EPA + marcador + QB titular, calibrado): si falla, queda el simulador viejo
+        nfl_v2 = {}
+        nfl_games = [g for g in games if g.sport == SportType.NFL]
+        if nfl_games and os.getenv("NFL_MODEL", "v2").lower() != "v1":
+            from app.services.nfl_v2 import predict_games_sync as nfl_predict
+            try:
+                nfl_v2 = await asyncio.to_thread(
+                    nfl_predict, [(g.id, g.home_team_name, g.away_team_name, g.game_date) for g in nfl_games])
+                logger.info(f"NFL v2: {len(nfl_v2)}/{len(nfl_games)} partidos")
+            except Exception as e:
+                logger.warning(f"NFL v2 no disponible ({type(e).__name__}: {e}); se usa monte_carlo_v1")
+            await self.db.execute(delete(Prediction).where(Prediction.game_id.in_([g.id for g in nfl_games])))
+            await self.db.flush()
+
         for game in games:
             game_date_str = game.game_date.isoformat() if game.game_date else None
             
@@ -135,6 +149,14 @@ class PredictionEngine:
                         await log_prediction(self.db, game, "nba_possessions_v1", v1)
                 except Exception as e:
                     logger.warning(f"NBA: no se pudo guardar la predicción en el registro ({type(e).__name__}: {e})")
+            elif game.sport == SportType.NFL and game.id in nfl_v2:
+                pred_result = nfl_v2[game.id]
+                model_name = "nfl_v2"
+                from app.services.nba_tracking import log_prediction
+                try:
+                    await log_prediction(self.db, game, model_name, pred_result)
+                except Exception as e:
+                    logger.warning(f"NFL: no se pudo guardar la predicción en el registro ({type(e).__name__}: {e})")
             else:
                 # 1. Run Models & Simulations for US Sports
                 pred_result = self.simulation_engine.simulate(game.sport, features)
@@ -175,7 +197,10 @@ class PredictionEngine:
                     odds_list.append(o)
             
             # 4. Calculate Value Picks
-            picks = self.value_calc.find_value_picks(prediction, odds_list, game)
+            if model_name == "nfl_v2":
+                picks = self._nfl_v2_picks(prediction, game)
+            else:
+                picks = self.value_calc.find_value_picks(prediction, odds_list, game)
             for p in picks:
                 p_db = Pick(
                     game_id=game.id,
@@ -198,3 +223,30 @@ class PredictionEngine:
 
         await self.db.commit()
         logger.info(f"Generated predictions for {len(games)} games")
+
+    @staticmethod
+    def _nfl_v2_picks(prediction, game) -> List[Dict[str, Any]]:
+        """Picks de la NFL: solo spread o total con nivel "recomendado" según las probabilidades
+        calibradas (el backtest no encontró ventaja, así que casi nunca habrá). Nunca moneyline."""
+        from app.services.nba_tracking import _implied, _market
+        from app.services.nfl_v2 import nfl_picks
+        mk = _market(game)
+        picks = nfl_picks(prediction.home_win_prob, -prediction.predicted_spread, prediction.predicted_total,
+                          mk["market_margin"], mk["market_total"], mk["ml_home"], mk["ml_away"],
+                          mk["spread_home_odds"], mk["spread_away_odds"], mk["over_odds"], mk["under_odds"],
+                          home_name=game.home_team_name, away_name=game.away_team_name)
+        out = []
+        for key, market in (("spread", MarketType.SPREAD), ("total", MarketType.OVER_UNDER)):
+            pk = picks.get(key)
+            if not pk or pk.get("tier") != "recomendado":
+                continue
+            odds = pk["odds"]
+            dec = 1 + (odds / 100 if odds > 0 else 100 / -odds)
+            out.append({
+                "market": market, "pick_type": f"{key}_{pk['side']}", "pick_description": pk["label"],
+                "model_probability": pk["prob"], "model_edge": pk["edge"],
+                "expected_value": pk["prob"] * dec - 1, "best_sportsbook": "DraftKings", "best_odds": odds,
+                "best_odds_decimal": dec, "implied_probability": _implied(odds),
+                "value_rating": min(5, max(1, int(pk["edge"] * 100))),
+            })
+        return out

@@ -195,7 +195,7 @@ async def get_game_predictions(
     # Lo que recomendó el modelo antes del partido (registro congelado), para los ya empezados
     from app.db_models import NBAPredictionLog
     logs = {r.game_id: r for r in (await db.execute(select(NBAPredictionLog).where(and_(
-        NBAPredictionLog.game_id.in_(game_ids), NBAPredictionLog.model_name == "nba_players_v2")))).scalars().all()}
+        NBAPredictionLog.game_id.in_(game_ids), NBAPredictionLog.model_name.in_(("nba_players_v2", "nfl_v2")))))).scalars().all()}
 
     # Logos (los manda ESPN; se guardan en la tabla de equipos)
     from app.db_models import Team
@@ -606,26 +606,34 @@ def _result(g, pred, frozen: Optional[dict] = None) -> Optional[dict]:
 
 def _model_picks(g, pred, odds_summary, log) -> Optional[dict]:
     """Lado que prefiere el modelo en ganador, spread y total, con su valor y, si terminó, el resultado.
-    Para partidos ya empezados se usa la predicción congelada antes del inicio."""
-    if g.sport != SportType.NBA:
+    Para partidos ya empezados se usa la predicción congelada antes del inicio. NBA y NFL v2."""
+    if g.sport == SportType.NBA:
+        from app.services.nba_tracking import _abbr, market_picks
+
+        def picker(*a, home_pts=None, away_pts=None):
+            return market_picks(*a, home_pts, away_pts, _abbr(g.home_team_name), _abbr(g.away_team_name))
+    elif g.sport == SportType.NFL and (log is not None or (pred is not None and pred.model_name == "nfl_v2")):
+        from app.services.nfl_v2 import nfl_picks
+
+        def picker(*a, home_pts=None, away_pts=None):
+            return nfl_picks(*a, home_pts, away_pts, g.home_team_name, g.away_team_name)
+    else:
         return None
-    from app.services.nba_tracking import _abbr, market_picks
     if log is not None and (g.status != GameStatus.SCHEDULED or (g.game_time and g.game_time <= datetime.utcnow())):
         hp, ap = log.home_pts, log.away_pts
         if hp is None and g.status == GameStatus.FINISHED:
             hp, ap = g.home_score, g.away_score          # ESPN ya tiene el final aunque el registro no se haya liquidado
-        picks = market_picks(log.home_win_prob, log.pred_margin, log.pred_total, log.market_margin, log.market_total,
-                             log.ml_home, log.ml_away, log.spread_home_odds, log.spread_away_odds,
-                             log.over_odds, log.under_odds, hp, ap, _abbr(g.home_team_name), _abbr(g.away_team_name))
+        picks = picker(log.home_win_prob, log.pred_margin, log.pred_total, log.market_margin, log.market_total,
+                       log.ml_home, log.ml_away, log.spread_home_odds, log.spread_away_odds,
+                       log.over_odds, log.under_odds, home_pts=hp, away_pts=ap)
         return {**picks, "frozen": True}
     if pred is None or pred.predicted_spread is None:
         return None
     o = odds_summary or {}
     sp, tt = o.get("spread") or {}, o.get("total") or {}
-    picks = market_picks(
+    picks = picker(
         pred.home_win_prob, -pred.predicted_spread, pred.predicted_total,
         None if sp.get("home_line") is None else -sp["home_line"], tt.get("line"),
         (o.get("best_home_ml") or {}).get("odds"), (o.get("best_away_ml") or {}).get("odds"),
-        sp.get("home_odds"), sp.get("away_odds"), tt.get("over_odds"), tt.get("under_odds"),
-        home_abbr=_abbr(g.home_team_name), away_abbr=_abbr(g.away_team_name))
+        sp.get("home_odds"), sp.get("away_odds"), tt.get("over_odds"), tt.get("under_odds"))
     return {**picks, "frozen": False}

@@ -115,12 +115,12 @@ async def get_nfl_games_espn(target_date: Optional[date] = None) -> List[Dict]:
                     "home": {
                         "id":   int(home_team.get("id", 0)),
                         "name": home_team.get("displayName", ""),
-                        "logo": (home_team.get("logos") or [{}])[0].get("href", ""),
+                        "logo": home_team.get("logo") or (home_team.get("logos") or [{}])[0].get("href", ""),
                     },
                     "away": {
                         "id":   int(away_team.get("id", 0)),
                         "name": away_team.get("displayName", ""),
-                        "logo": (away_team.get("logos") or [{}])[0].get("href", ""),
+                        "logo": away_team.get("logo") or (away_team.get("logos") or [{}])[0].get("href", ""),
                     },
                 },
                 "scores": {
