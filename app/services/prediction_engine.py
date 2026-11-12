@@ -41,12 +41,22 @@ class PredictionEngine:
         games_result = await self.db.execute(games_query)
         games = games_result.scalars().all()
 
-        # Clear existing picks for that date (and sports) to avoid duplicates
+        # Un partido que ya empezó (o terminó) no se vuelve a predecir: su predicción queda
+        # congelada tal como estaba antes del inicio, que es la que se mide.
+        from datetime import datetime
+        from app.db_models import GameStatus
+        now = datetime.utcnow()
+        started = [g for g in games if g.status not in (None, GameStatus.SCHEDULED)
+                   or (g.game_time is not None and g.game_time <= now)]
+        if started:
+            logger.info(f"{len(started)} partidos ya empezaron: se conserva su predicción previa")
+        games = [g for g in games if g not in started]
+        if not games:
+            return
+
+        # Clear existing picks of the games being re-predicted (avoid duplicates)
         from sqlalchemy import delete
-        picks_delete = delete(Pick).where(Pick.game_date == target_date)
-        if sports:
-            picks_delete = picks_delete.where(Pick.sport.in_(sports))
-        await self.db.execute(picks_delete)
+        await self.db.execute(delete(Pick).where(Pick.game_id.in_([g.id for g in games])))
         await self.db.flush()
 
         # NBA v2 (modelo de jugadores): se calcula todo el día de una vez; si falla, queda v1
