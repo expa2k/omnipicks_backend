@@ -224,7 +224,7 @@ async def get_game_predictions(
             "away_score": g.away_score,
             "home_logo": logos.get(g.home_team_id) or None,
             "away_logo": logos.get(g.away_team_id) or None,
-            "result": _result(g, pred),
+            "result": _result(g, pred, _frozen(g, logs.get(g.id))),
             "model_picks": _model_picks(g, pred, odds_summary, logs.get(g.id)),
             "lineups": g.raw_data.get("lineups") if g.raw_data and isinstance(g.raw_data, dict) else None,
             # Prediction (protagonist)
@@ -258,6 +258,10 @@ async def get_game_predictions(
                 "tier": pick_tier(pk.model_edge),
             } for pk in game_picks] if game_picks else [],
         }
+        fz = _frozen(g, logs.get(g.id))
+        if fz and game_obj["prediction"]:
+            # Partido ya empezado: se muestra la predicción congelada antes del inicio (la que se mide)
+            game_obj["prediction"].update(fz)
         response_games.append(game_obj)
 
     return {
@@ -562,12 +566,34 @@ def _odds_summary(odds_list) -> Optional[dict]:
 
 
 
-def _result(g, pred) -> Optional[dict]:
-    """Marcador final y si el modelo acertó al ganador (solo partidos terminados)."""
+def _frozen(g, log) -> Optional[dict]:
+    """Predicción previa al partido (del registro) si el partido ya empezó."""
+    if log is None:
+        return None
+    started = g.status != GameStatus.SCHEDULED or (g.game_time is not None and g.game_time <= datetime.utcnow())
+    if not started:
+        return None
+    m, t = log.pred_margin, log.pred_total
+    out = {"home_win_prob": round(log.home_win_prob, 4), "away_win_prob": round(1 - log.home_win_prob, 4),
+           "predicted_spread": round(-m, 1), "frozen": True, "frozen_at": log.predicted_at.isoformat() + "Z"}
+    if t is not None:
+        out.update({"predicted_total": round(t, 1), "predicted_home_score": round((t + m) / 2, 1),
+                    "predicted_away_score": round((t - m) / 2, 1)})
+    return out
+
+
+def _result(g, pred, frozen: Optional[dict] = None) -> Optional[dict]:
+    """Marcador final y si el modelo acertó al ganador (solo partidos terminados).
+    Se mide con la predicción previa al partido cuando existe."""
     if g.status != GameStatus.FINISHED or g.home_score is None or g.away_score is None:
         return None
     out = {"home_score": g.home_score, "away_score": g.away_score,
            "winner": "home" if g.home_score > g.away_score else "away" if g.away_score > g.home_score else "draw"}
+    if frozen is not None:
+        out["model_pick"] = "home" if frozen["home_win_prob"] >= 0.5 else "away"
+        out["hit"] = out["model_pick"] == out["winner"]
+        out["margin_error"] = round(abs(-frozen["predicted_spread"] - (g.home_score - g.away_score)), 1)
+        return out
     if pred is not None:
         probs = {"home": pred.home_win_prob or 0, "away": pred.away_win_prob or 0, "draw": pred.draw_prob or 0}
         out["model_pick"] = max(probs, key=probs.get)

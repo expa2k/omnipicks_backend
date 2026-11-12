@@ -203,23 +203,11 @@ async def settle(db: AsyncSession) -> int:
     for r in pending:
         if r.game_time is not None and now < r.game_time + timedelta(hours=2):
             continue                                        # todavía no termina
-        h, a = ids.get(r.home_team.lower()), ids.get(r.away_team.lower())
-        score = None
-        if h and a:
-            # Misma fecha exacta (ET en ESPN y en nba_api): hay series de 2 partidos seguidos en la misma sede
-            res = (await db.execute(text(
-                "SELECT home_pts, away_pts FROM nba_games WHERE home_team_id = :h AND away_team_id = :a "
-                "AND game_date = :d AND home_pts IS NOT NULL LIMIT 1"),
-                {"h": h, "a": a, "d": r.game_date})).first()
-            if res:
-                score = (int(res[0]), int(res[1]))
-        if score is None:
-            g = (await db.execute(select(Game).where(Game.id == r.game_id))).scalar_one_or_none()
-            if g is not None and g.status == GameStatus.FINISHED and g.home_score is not None and g.away_score is not None:
-                score = (int(g.home_score), int(g.away_score))
-        if score is None:
+        # Fuente: el marcador FINAL de ESPN (estado "final"). nba_api puede publicar parciales.
+        g = (await db.execute(select(Game).where(Game.id == r.game_id))).scalar_one_or_none()
+        if g is None or g.status != GameStatus.FINISHED or g.home_score is None or g.away_score is None:
             continue
-        r.home_pts, r.away_pts, r.settled_at = score[0], score[1], _utcnow()
+        r.home_pts, r.away_pts, r.settled_at = int(g.home_score), int(g.away_score), _utcnow()
         done += 1
     await db.commit()
     if done:

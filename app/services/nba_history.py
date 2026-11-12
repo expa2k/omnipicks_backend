@@ -73,8 +73,17 @@ def fetch_season(season: str, season_type: str):
 
     games: Dict[str, Dict] = {}
     opp: Dict[tuple, int] = {}
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    today_et = datetime.now(ZoneInfo("America/New_York")).date()
     for gid, grp in lg.groupby("GAME_ID"):
         if len(grp) != 2:
+            continue
+        # Solo partidos terminados: la NBA publica los que siguen en juego (sin W/L y con puntos parciales),
+        # y los de hoy pueden tener estadísticas todavía incompletas
+        if "WL" in grp and grp["WL"].isna().any():
+            continue
+        if date.fromisoformat(str(grp.iloc[0].GAME_DATE)[:10]) >= today_et:
             continue
         a, b = grp.iloc[0], grp.iloc[1]
         home, away = (b, a) if " @ " in a.MATCHUP else (a, b)
@@ -365,7 +374,10 @@ def load_season(engine, season: str) -> int:
                 conn.execute(stmt.on_duplicate_key_update(
                     home_pts=stmt.inserted.home_pts, away_pts=stmt.inserted.away_pts))
             for part in _chunks(player_games):
-                conn.execute(mysql_insert(NBAPlayerGame).values(part).prefix_with("IGNORE"))
+                stmt = mysql_insert(NBAPlayerGame).values(part)
+                cols = ("minutes", "pts", "fgm", "fga", "fg3m", "fg3a", "ftm", "fta", "oreb", "dreb",
+                        "ast", "stl", "blk", "tov", "pf", "plus_minus")
+                conn.execute(stmt.on_duplicate_key_update(**{c: stmt.inserted[c] for c in cols}))
         total += len(games)
         logger.info(f"{season} {season_type}: {len(games)} partidos, {len(player_games)} filas de jugador")
     return total
