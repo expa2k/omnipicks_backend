@@ -223,8 +223,17 @@ con cuasi-verosimilitud Poisson y gradiente analítico. El rho de los marcadores
 - **Scheduler:** `job_soccer` cada hora (de ayer a 7 días: marcadores, momios y predicciones).
 - **Front:** "Por qué este pronóstico" con goles esperados, ataque y defensa (o liga y fuerza de liga en copas), marcador más probable, más de 2.5 y ambos anotan. Incluye la nota de que es un pronóstico, no una apuesta.
 
+### Historial y rendimiento en vivo
+
+- `nba_prediction_log` tiene dos columnas nuevas: `draw_prob` (probabilidad de empate) y `ml_draw` (momio del empate al predecir). Se agregaron con `ALTER TABLE ... ADD COLUMN` el 13-nov-2026.
+- `GET /api/predictions/soccer/performance` (`performance(db, days, sport="soccer")`). Trae:
+  - acierto del resultado más probable (1X2), log loss y Brier, error de goles totales;
+  - el mismo log loss y acierto del casino, con los momios de DraftKings guardados al predecir y sin su margen;
+  - los últimos partidos con el resultado que el modelo veía más probable, su probabilidad y la que daba el casino;
+  - el backtest de las fases 1–4.
+- **Front:** pestaña **Fútbol** en el historial de Bankroll y en el panel "Modelo … en vivo" del Resumen.
+
 **Pendiente:**
-- Historial y rendimiento en vivo del fútbol en la app (como la NBA y la NFL).
 - Separar "otras ligas" por país.
 - xG de football-data cuando se junte la temporada.
 - Alineaciones y bajas (fase 6, opcional).

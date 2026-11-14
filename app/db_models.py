@@ -499,6 +499,7 @@ class NBAPredictionLog(Base):
     predicted_at = Column(DateTime, nullable=False)            # UTC
     minutes_before_tip = Column(Float, nullable=True)
     home_win_prob = Column(Float, nullable=False)
+    draw_prob = Column(Float, nullable=True)                   # fútbol: probabilidad de empate
     pred_margin = Column(Float, nullable=False)                # local − visita
     pred_total = Column(Float, nullable=True)
     market_margin = Column(Float, nullable=True)               # −spread del local (ESPN/DraftKings)
@@ -506,6 +507,7 @@ class NBAPredictionLog(Base):
     market_provider = Column(String(50), nullable=True)
     ml_home = Column(Float, nullable=True)                     # momios americanos al momento de predecir
     ml_away = Column(Float, nullable=True)
+    ml_draw = Column(Float, nullable=True)                     # fútbol: momio del empate
     spread_home_odds = Column(Float, nullable=True)
     spread_away_odds = Column(Float, nullable=True)
     over_odds = Column(Float, nullable=True)

@@ -526,6 +526,17 @@ async def get_nba_performance(
     return await performance(db, days)
 
 
+@router.get("/soccer/performance")
+async def get_soccer_performance(
+    days: Optional[int] = Query(None, description="Solo los últimos N días"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Rendimiento en vivo del fútbol v2: 1X2 previo a cada partido contra el resultado y el mercado."""
+    from app.services.nba_tracking import performance, settle
+    await settle(db)
+    return await performance(db, days, sport="soccer")
+
+
 @router.get("/nfl/performance")
 async def get_nfl_performance(
     days: Optional[int] = Query(None, description="Solo los últimos N días"),

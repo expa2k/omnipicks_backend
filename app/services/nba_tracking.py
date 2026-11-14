@@ -44,7 +44,7 @@ def _market(game: Game) -> Dict:
     if odds.get("total_line") is not None:
         total = float(odds["total_line"])
     return {"market_margin": margin, "market_total": total, "market_provider": odds.get("provider"),
-            "ml_home": odds.get("ml_home"), "ml_away": odds.get("ml_away"),
+            "ml_home": odds.get("ml_home"), "ml_away": odds.get("ml_away"), "ml_draw": odds.get("ml_draw"),
             "spread_home_odds": odds.get("spread_home_odds"), "spread_away_odds": odds.get("spread_away_odds"),
             "over_odds": odds.get("over_odds"), "under_odds": odds.get("under_odds")}
 
@@ -191,6 +191,7 @@ async def log_prediction(db: AsyncSession, game: Game, model_name: str, pred: Di
         "home_team": game.home_team_name, "away_team": game.away_team_name, "predicted_at": now,
         "minutes_before_tip": None if game.game_time is None else round((game.game_time - now).total_seconds() / 60.0, 1),
         "home_win_prob": float(pred["home_win_prob"]),
+        "draw_prob": None if pred.get("draw_prob") is None else float(pred["draw_prob"]),
         "pred_margin": -float(pred["predicted_spread"]) if pred.get("predicted_spread") is not None else 0.0,
         "pred_total": pred.get("predicted_total"), **_market(game),
     }
@@ -284,7 +285,51 @@ def _market_records(rows: List[NBAPredictionLog]) -> Dict:
 
 
 SPORT_MODELS = {"nba": ("nba_players_v2", ("nba_players_v2", "nba_possessions_v1")),
-                "nfl": ("nfl_v2", ("nfl_v2",))}
+                "nfl": ("nfl_v2", ("nfl_v2",)),
+                "soccer": ("soccer_v2", ("soccer_v2",))}
+
+
+def _soccer_probs(r) -> List[float]:
+    pd_ = r.draw_prob or 0.0
+    return [r.home_win_prob, pd_, max(0.0, 1.0 - r.home_win_prob - pd_)]
+
+
+def _soccer_market(r) -> Optional[List[float]]:
+    if r.ml_home is None or r.ml_away is None or r.ml_draw is None:
+        return None
+    imp = [_implied(r.ml_home), _implied(r.ml_draw), _implied(r.ml_away)]
+    if any(x is None for x in imp):
+        return None
+    t = sum(imp)
+    return [x / t for x in imp]
+
+
+def _soccer_summary(rows: List[NBAPredictionLog]) -> Optional[Dict]:
+    """Fútbol: acierto del resultado (1X2), log loss y Brier, error de goles y lo mismo del mercado."""
+    if not rows:
+        return None
+    hits, ll, br, err_t, mk = 0, 0.0, 0.0, 0.0, []
+    for r in rows:
+        p = _soccer_probs(r)
+        y = 0 if r.home_pts > r.away_pts else 1 if r.home_pts == r.away_pts else 2
+        hits += int(max(range(3), key=lambda k: p[k]) == y)
+        ll += -math.log(min(max(p[y], 1e-4), 1.0))
+        br += sum((p[k] - (1.0 if k == y else 0.0)) ** 2 for k in range(3))
+        if r.pred_total is not None:
+            err_t += abs(r.pred_total - (r.home_pts + r.away_pts))
+        q = _soccer_market(r)
+        if q is not None:
+            mk.append((q, y, p))
+    n = len(rows)
+    vs = None
+    if mk:
+        vs = {"games": len(mk),
+              "market_pct": round(sum(max(range(3), key=lambda k: q[k]) == y for q, y, _ in mk) / len(mk), 3),
+              "market_logloss": round(sum(-math.log(max(q[y], 1e-4)) for q, y, _ in mk) / len(mk), 4),
+              "model_logloss": round(sum(-math.log(max(p[y], 1e-4)) for _, y, p in mk) / len(mk), 4)}
+        vs["market_winner_pct"] = vs["market_pct"]          # mismo nombre que la NBA/NFL para el panel
+    return {"games": n, "winner_pct": round(hits / n, 3), "logloss": round(ll / n, 4), "brier": round(br / n, 4),
+            "mae_total": round(err_t / n, 2), "mae_margin": None, "vs_market": vs, "markets": None}
 
 
 async def performance(db: AsyncSession, days: Optional[int] = None, sport: str = "nba") -> Dict:
@@ -302,6 +347,24 @@ async def performance(db: AsyncSession, days: Optional[int] = None, sport: str =
     by_model: Dict[str, List[NBAPredictionLog]] = {}
     for r in rows:
         by_model.setdefault(r.model_name, []).append(r)
+    if sport == "soccer":
+        outs = ("home", "draw", "away")
+        recent = []
+        for r in by_model.get(main, [])[:200]:
+            p = _soccer_probs(r)
+            k = max(range(3), key=lambda j: p[j])
+            y = 0 if r.home_pts > r.away_pts else 1 if r.home_pts == r.away_pts else 2
+            q = _soccer_market(r)
+            recent.append({"date": r.game_date.isoformat(), "matchup": f"{r.home_team} vs {r.away_team}",
+                           "home": r.home_team, "away": r.away_team, "final": f"{r.home_pts}-{r.away_pts}",
+                           "probs": [round(x, 3) for x in p], "pick": outs[k], "pick_prob": round(p[k], 3),
+                           "result": outs[y], "hit": k == y, "market": None if q is None else [round(x, 3) for x in q],
+                           "pred_goals": None if r.pred_total is None else round(r.pred_total, 2)})
+        from app.services.soccer_v2 import BACKTEST
+        pending = (await db.execute(text("SELECT COUNT(*) FROM nba_prediction_log WHERE settled_at IS NULL AND model_name = :m"),
+                                    {"m": main})).scalar()
+        return {"sport": sport, "main_model": main, "models": {k: _soccer_summary(v) for k, v in by_model.items()},
+                "recent": recent, "backtest": BACKTEST, "pending": pending}
     recent = [{
         "date": r.game_date.isoformat(), "matchup": f"{r.away_team} @ {r.home_team}",
         "away_abbr": abbr_fn(r.away_team), "home_abbr": abbr_fn(r.home_team),

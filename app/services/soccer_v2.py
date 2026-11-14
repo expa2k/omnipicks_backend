@@ -36,6 +36,10 @@ LEAGUES = ["Premier League", "La Liga", "Serie A", "Bundesliga", "Ligue 1", "Lig
 CUPS = {"UEFA Champions League", "UEFA Europa League"}
 REFIT_SECONDS = 6 * 3600
 
+# Backtest (docs/PLAN_FUTBOL.md, fases 1–4): 6 ligas, 2022–2026, semana a semana
+BACKTEST = {"games": 9083, "seasons": "2022–2026", "logloss": 0.9868, "logloss_pinnacle": 0.9667,
+            "logloss_base": 1.0714, "mae_total": 1.32, "cups_logloss": 0.9457, "cups_games": 2718}
+
 _lock = threading.Lock()
 _state: Dict = {"at": 0.0}
 
