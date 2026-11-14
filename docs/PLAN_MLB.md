@@ -30,10 +30,10 @@ Solo corre con el pipeline viejo, que está apagado. Acertó el ganador en 58.6%
 | Fase | Qué | Estado |
 |---|---|---|
 | 0 | Fuentes y descarga del histórico | ✅ |
-| 1 | Abridores: rating propio por pitcher (K%, BB%, HR, contacto) y entradas esperadas | |
-| 2 | Bullpen y alineación contra la mano del abridor | |
-| 3 | Parque, clima, localía y distribución de carreras | |
-| 4 | Backtest de apuestas contra el cierre (2015–2021) | |
+| 1 | Abridores, alineación, bullpen y parque en un solo modelo de carreras | ✅ |
+| 2 | Bullpen cansado y ventaja de mano | ✅ (efecto chico) |
+| 3 | Distribución de carreras (binomial negativa) → moneyline, run line y total | ✅ |
+| 4 | Backtest contra el cierre (2015–2021) | ✅ sin ventaja |
 | 5 | Producción: StatsAPI (abridores probables, alineaciones), ESPN (líneas), tareas automáticas y front | |
 
 ## Fase 0: fuentes (13-nov-2026, `app/services/mlb_history.py`)
@@ -52,3 +52,55 @@ Solo corre con el pipeline viejo, que está apagado. Acertó el ganador en 58.6%
 - La temporada 2027 empieza a finales de marzo: la meta es tener la v2 en producción antes.
 
 Uso de Retrosheet: "The information used here was obtained free of charge from and is copyrighted by Retrosheet. Interested parties may contact Retrosheet at www.retrosheet.org."
+
+## Fases 1–3: modelo de carreras (`app/services/mlb_model.py`, `ml/scripts/mlb_eval.py`)
+
+Por cada equipo y partido:
+
+    log E[carreras] = μ + localía + noche + parque + ataque[equipo, temporada] − defensa[rival, temporada]
+                      + (1/9) Σ bateo[alineación del día] − abridor[rival]
+                      + ventaja de mano · (fracción de la alineación con ventaja contra el abridor)
+                      + cansancio · (lanzadores del bullpen rival en sus 2 juegos previos)
+
+- **Ajuste:** cuasi-Poisson con matriz rala, ξ = 0.002 por día y ~3 años de historia. Ridge: bateadores 40, **abridor 150**, equipo 6, parque 10.
+- **Carreras:** binomial negativa con dispersión r ≈ 4.4.
+- **Mercados:** moneyline (con extras: el local gana 52% de los empates), run line y total.
+- **Mano** de cada jugador (`load_handedness`): MLB StatsAPI más el registro de Chadwick (Retrosheet ↔ MLBAM), 5,361 jugadores.
+
+**Backtest** (cada 14 días; log loss del ganador; 2015–2019 | 2021–2025):
+
+| Modelo | 2015–2019 | 2021–2025 |
+|---|---|---|
+| Base (% de local) | 0.6909 | 0.6913 |
+| Solo equipos (ataque y defensa por temporada) | 0.6853 | 0.6857 |
+| Solo jugadores, sin nivel de equipo | 0.6856 | 0.6877 |
+| **Equipos + jugadores + contexto (elegido)** | **0.6844** | **0.6851** |
+| + ponches, BB y HR del abridor (tipo xFIP) | 0.6833 | 0.6862 |
+
+Error del total ≈ 3.56–3.60 carreras.
+
+**Qué dice:**
+- Los jugadores mejoran **encima** del nivel de cada equipo. Solos, sin el equipo, empeoran.
+- El abridor necesita mucho encogimiento: las carreras de un juego tienen mucho azar.
+- Mejores abridores en el último ajuste: Sale, Skubal, Crochet, Skenes, Senga, Valdez, Snell, Wheeler.
+- Ponches, bases por bolas y jonrones del abridor mejoran 2015–2019, pero empeoran 2021–2025, seguramente por los cambios de reglas de 2023 (reloj de lanzamiento, sin shift). No entran.
+- Ventaja de mano y cansancio del bullpen: coeficientes chicos (+0.06 y −0.001 por lanzador).
+
+## Fase 4: contra los momios de cierre (`ml/scripts/mlb_backtest.py`)
+
+15,402 juegos de 2015–2021 con momios de cierre de SBR (`load_odds` empareja los códigos de SBR con los de Retrosheet; en las dobles carteleras se empareja por marcador).
+
+- **Log loss del ganador:** modelo **0.6849** contra cierre sin margen **0.6715**. El mercado está bastante mejor.
+- **Apuestas** de 1 unidad con momios de cierre:
+
+| Regla | 2015–2018 | 2019–2021 |
+|---|---|---|
+| Moneyline, valor > 0% | 8,282 · −4.1% | 5,075 · −2.9% |
+| Moneyline, valor > 3% | 6,843 · −4.7% | 4,180 · −2.0% |
+| Run line, valor > 0% | 8,090 · −5.1% | 4,852 · −4.4% |
+| Total, valor > 0% | 7,346 · −2.6% | 4,447 · −0.8% |
+| Moneyline, confianza ≥ 60% | 3,002 · −3.5% | 2,021 · −1.7% |
+| Total, confianza ≥ 60% | 2,590 · −3.0% | 1,983 · −3.1% |
+| Run line, confianza ≥ 60% | 6,092 · −4.6% | 3,302 · −2.2% |
+
+**Igual que en NFL y fútbol: no hay ventaja contra el cierre.** Se pierde más o menos el margen del casino. El total es lo más cercano a cero (−0.8% en 2019–2021, dentro del ruido). En la app, los picks del modelo se muestran con su confianza y se miden en vivo.
