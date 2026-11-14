@@ -196,15 +196,48 @@ def soccer_picks(pred, odds_summary: Optional[Dict], home_name: str, away_name: 
             "away": (o.get("best_away_ml") or {}).get("odds")}[k]
     res = None if not done else ("home" if home_goals > away_goals else "draw" if home_goals == away_goals else "away")
     out = {"winner": item(lab, k, probs[k], odds, res == k)}
-    p_over = sd.get("over_2_5")
-    if p_over is not None:
-        tt = o.get("total") or {}
-        line_ok = tt.get("line") == 2.5
-        over = p_over >= 0.5
-        out["total"] = item("Más de 2.5" if over else "Menos de 2.5", "over" if over else "under",
-                            p_over if over else 1 - p_over,
-                            (tt.get("over_odds") if over else tt.get("under_odds")) if line_ok else None,
-                            done and ((home_goals + away_goals > 2.5) == over))
+    # Matriz de marcadores con los goles esperados (para hándicap y más/menos a cualquier línea)
+    xg = sd.get("expected_goals") or {}
+    m = score_matrix(float(xg.get("home", 1.3)), float(xg.get("away", 1.1)), -0.05)
+    g = np.arange(m.shape[0])
+    margin = g[:, None] - g[None, :]
+    goals = g[:, None] + g[None, :]
+
+    def settle(dg, line):            # dg = goles del local − visitante; línea del local
+        r = dg + line
+        return 1.0 if r > 0 else (0.5 if r == 0 else 0.0)
+
+    # Hándicap: con la línea del casino si la hay; si no, hándicap 0 (sin empate)
+    sp = o.get("spread") or {}
+    hl = sp.get("home_line")
+    line = float(hl) if hl is not None else 0.0
+    p_home = float(m[margin + line > 0].sum()); p_push = float(m[np.isclose(margin + line, 0)].sum())
+    p_home_c = p_home / max(1 - p_push, 1e-9)
+    home_side = p_home_c >= 0.5
+    lbl = (f"{ab(home_name)} {line:+g}" if home_side else f"{ab(away_name)} {-line:+g}") if hl is not None else \
+        f"{ab(home_name) if home_side else ab(away_name)} (sin empate)"
+    sp_odds = (sp.get("home_odds") if home_side else sp.get("away_odds")) if hl is not None else None
+    won = None
+    if done:
+        r = settle(home_goals - away_goals, line)
+        won = (r == 1.0) if home_side else (r == 0.0)
+    it = item(lbl, "home" if home_side else "away", p_home_c if home_side else 1 - p_home_c, sp_odds, won)
+    if done and settle(home_goals - away_goals, line) == 0.5:
+        it["result"] = "push"
+    out["spread"] = it
+
+    # Más/menos: con la línea del casino si la hay; si no, 2.5
+    tt = o.get("total") or {}
+    tl = float(tt["line"]) if tt.get("line") is not None else 2.5
+    p_over = float(m[goals > tl].sum()); p_push_t = float(m[goals == tl].sum())
+    p_over_c = p_over / max(1 - p_push_t, 1e-9)
+    over = p_over_c >= 0.5
+    it = item(f"{'Más' if over else 'Menos'} de {tl:g}", "over" if over else "under", p_over_c if over else 1 - p_over_c,
+              (tt.get("over_odds") if over else tt.get("under_odds")) if tt.get("line") is not None else None,
+              done and ((home_goals + away_goals > tl) == over))
+    if done and home_goals + away_goals == tl:
+        it["result"] = "push"
+    out["total"] = it
     p_b = sd.get("btts")
     if p_b is not None:
         yes = p_b >= 0.5
