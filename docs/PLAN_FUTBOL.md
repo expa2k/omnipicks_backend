@@ -172,3 +172,32 @@ con cuasi-verosimilitud Poisson y gradiente analítico. El rho de los marcadores
 - No hay momios históricos de copas para comparar contra el mercado. Se medirá en vivo con los momios de ESPN.
 - El valor de "otras ligas" mezcla ligas muy distintas (Turquía con Islas Feroe). Mejora posible: separar por país con ESPN (ligas de Portugal, Bélgica, Turquía, Escocia…), o usar ClubElo cuando vuelva.
 - **Decisión:** las copas usan el modelo conjunto; las ligas siguen con el Dixon-Coles de las fases 1 y 2.
+
+## Fase 4: mercados y backtest con momios reales (`ml/scripts/soccer_backtest.py`) — sin ventaja
+
+**Modelo:** el de la fase 2 (Dixon-Coles con 70% goles + 30% tiros a puerta; solo goles en la Liga MX), semana a semana en las 6 ligas desde 2019. De la matriz de marcadores salen el 1X2, el más/menos 2.5 y el hándicap asiático (las líneas de ¼ se reparten en dos medias apuestas).
+
+**Calibración del 1X2** (temperatura aprendida con temporadas anteriores):
+- La temperatura sale en **0.90–0.92**: el modelo es **un poco conservador**; sus favoritos ganan algo más de lo que dice. Corregirlo baja el log loss de 0.9884 a 0.9868 en 2022–26 (Pinnacle: 0.9667).
+- Ya calibrado, en 2022–26: prevé 0.149 y ocurre 0.138; prevé 0.266 → 0.265; 0.421 → 0.423; 0.567 → 0.571; 0.725 → 0.747. Bien calibrado.
+
+**Apuestas** (1 unidad cuando el valor esperado con la probabilidad calibrada pasa el umbral):
+
+| Mercado (momios de cierre) | Umbral | 2020–21 | 2022–26 (limpia) |
+|---|---|---|---|
+| 1X2 en Pinnacle | > 0% | 6,101 apuestas · −1.7% (±5.0%) | 7,015 · **−12.2%** (±3.9%) |
+| 1X2 en Pinnacle | > 10% | 3,996 · +0.1% (±6.8%) | 4,267 · **−17.4%** (±5.2%) |
+| 1X2 en Bet365 | > 0% | 4,608 · −4.0% | 6,799 · −14.9% |
+| Más/menos 2.5 (promedio) | > 0% | 2,473 · −6.5% | 5,193 · −9.2% |
+| Hándicap asiático (promedio) | > 0% | 4,597 · −2.5% (±2.5%) | 5,950 · **−4.6%** (±2.2%) |
+| Hándicap asiático (promedio) | > 10% | 2,151 · −1.0% | 2,460 · −4.8% |
+
+**Qué dice:**
+- **No hay ventaja contra el cierre en ningún mercado.** En el hándicap asiático se pierde más o menos el margen del casino (~5%): el modelo no aporta ni quita.
+- En el **1X2 se pierde mucho más que el margen** (−12% a −17% en 2022–26). Las "apuestas con valor" del modelo caen sobre todo en empates y visitantes (ganan ~28%), donde el modelo se aleja más del mercado y es el mercado el que acierta.
+- Es lo mismo que pasó en la NFL: el modelo **pronostica bien** (cerca de Pinnacle y bien calibrado), pero **el cierre ya tiene esa información y más** (alineaciones, bajas, dinero informado).
+- **Para la app:**
+  - mostrar pronóstico, marcador probable y probabilidades calibradas;
+  - calcular el valor con las probabilidades calibradas, y casi todo debería salir "sin valor";
+  - **no recomendar el 1X2 por diferencias con el casino**, que es donde más se pierde;
+  - medir en vivo, y probar contra líneas de apertura cuando haya datos (football-data trae apertura promedio desde 2019).
