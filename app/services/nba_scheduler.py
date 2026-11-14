@@ -285,6 +285,33 @@ async def job_soccer():
         logger.warning(f"Fútbol: no se pudo actualizar ({type(e).__name__}: {e})")
 
 
+async def job_mlb():
+    """MLB v2: juegos de ayer a 2 días desde ESPN y predicciones (solo en temporada: marzo a noviembre)."""
+    from sqlalchemy import select, distinct
+    from app.db_models import Game, GameStatus, SportType
+    from app.services.data_ingestion import DataIngestionService
+    from app.services.prediction_engine import PredictionEngine
+    today = today_et()
+    if today.month in (12, 1) or (today.month == 2 and today.day < 15):
+        return                                   # fuera de temporada (incluye pretemporada temprana)
+    try:
+        n = 0
+        for k in range(-1, 3):
+            async with get_session_factory()() as db:
+                n += await DataIngestionService(db).ingest_mlb_espn(today + timedelta(days=k))
+        async with get_session_factory()() as db:
+            days = (await db.execute(select(distinct(Game.game_date)).where(
+                Game.sport == SportType.MLB, Game.status == GameStatus.SCHEDULED, Game.external_id.like("espn_%"),
+                Game.game_time > datetime.utcnow(), Game.game_time < datetime.utcnow() + timedelta(days=3)))).scalars().all()
+        for day in sorted(days):
+            async with _predict_lock, get_session_factory()() as db:
+                await PredictionEngine(db).run_predictions_for_date(day, sports=[SportType.MLB])
+        await settle_predictions()
+        logger.info(f"⚾ MLB: {n} juegos (ayer a 2 días); predicciones de {len(days)} días")
+    except Exception as e:
+        logger.warning(f"MLB: no se pudo actualizar ({type(e).__name__}: {e})")
+
+
 # NFL: los inactivos oficiales salen 90 min antes del partido. Cada 10 min en las 2 horas previas a
 # algún partido; cada hora el resto del tiempo.
 NFL_NEAR_MINUTES = 120
@@ -323,11 +350,13 @@ def start_nba_scheduler() -> Optional[AsyncIOScheduler]:
     _scheduler.add_job(job_update_history, CronTrigger(hour=4, minute=30), id="nba_history", **common)
     _scheduler.add_job(job_nfl_tick, IntervalTrigger(minutes=5), id="nfl", **common)
     _scheduler.add_job(job_soccer, IntervalTrigger(minutes=60), id="soccer", **common)
+    _scheduler.add_job(job_mlb, IntervalTrigger(minutes=30), id="mlb", **common)
     _scheduler.start()
     asyncio.get_running_loop().create_task(job_startup())            # ponerse al día al arrancar
     asyncio.get_running_loop().create_task(_nfl_startup())
     asyncio.get_running_loop().create_task(job_soccer())
-    logger.info("🏀 Tareas NBA programadas: lesiones cada 10 min cerca de los partidos (30 min el resto), histórico diario 04:30 ET; NFL cada 10 min en las 2 h previas a un partido (cada hora el resto); fútbol cada hora")
+    asyncio.get_running_loop().create_task(job_mlb())
+    logger.info("🏀 Tareas NBA programadas: lesiones cada 10 min cerca de los partidos (30 min el resto), histórico diario 04:30 ET; NFL cada 10 min en las 2 h previas a un partido (cada hora el resto); fútbol cada hora; MLB cada 30 min en temporada")
     return _scheduler
 
 

@@ -105,16 +105,42 @@ class PredictionEngine:
             await self.db.execute(delete(Prediction).where(Prediction.game_id.in_([g.id for g in soccer_games])))
             await self.db.flush()
 
+        # MLB v2 (carreras por jugador): solo juegos de ESPN
+        mlb_v2 = {}
+        mlb_games = [g for g in games if g.sport == SportType.MLB and (g.external_id or "").startswith("espn_")]
+        if mlb_games and os.getenv("MLB_MODEL", "v2").lower() != "v1":
+            from app.services.mlb_v2 import predict_games_sync as mlb_predict
+            try:
+                mlb_v2 = await asyncio.to_thread(mlb_predict, [
+                    (g.id, g.home_team_name, g.away_team_name, g.game_date,
+                     ((g.raw_data or {}).get("teams") or {}).get("home", {}).get("abbreviation"),
+                     ((g.raw_data or {}).get("teams") or {}).get("away", {}).get("abbreviation")) for g in mlb_games])
+                logger.info(f"MLB v2: {len(mlb_v2)}/{len(mlb_games)} juegos")
+            except Exception as e:
+                logger.warning(f"MLB v2 no disponible ({type(e).__name__}: {e}); se usa el modelo anterior")
+            await self.db.execute(delete(Prediction).where(Prediction.game_id.in_([g.id for g in mlb_games])))
+            await self.db.flush()
+
         for game in games:
             game_date_str = game.game_date.isoformat() if game.game_date else None
             
             # 1. Compute real advanced features for ALL sports (including Soccer via ESPN/API-Sports)
-            if game.sport == SportType.SOCCER and game.id in soccer_v2:
+            if (game.sport == SportType.SOCCER and game.id in soccer_v2) or (game.sport == SportType.MLB and game.id in mlb_v2):
                 features = {}       # fútbol v2 no usa estas variables (y evitarlas ahorra la cuota de API-Sports)
             else:
                 features = await self.feature_eng.compute_features(game.raw_data or {}, game.sport.value, game_date_str)
             
-            if game.sport == SportType.SOCCER and game.id in soccer_v2:
+            if game.sport == SportType.MLB and game.id in mlb_v2:
+                pred_result = mlb_v2[game.id]
+                model_name = "mlb_v2"
+                from app.services.nba_tracking import log_prediction
+                try:
+                    await log_prediction(self.db, game, model_name, pred_result)
+                except DBAPIError:
+                    raise
+                except Exception as e:
+                    logger.warning(f"MLB: no se pudo guardar la predicción en el registro ({type(e).__name__}: {e})")
+            elif game.sport == SportType.SOCCER and game.id in soccer_v2:
                 pred_result = soccer_v2[game.id]
                 model_name = "soccer_v2"
                 from app.services.nba_tracking import log_prediction
@@ -233,7 +259,7 @@ class PredictionEngine:
             # 4. Calculate Value Picks
             if model_name == "nfl_v2":
                 picks = self._nfl_v2_picks(prediction, game)
-            elif model_name == "soccer_v2":
+            elif model_name in ("soccer_v2", "mlb_v2"):
                 picks = []          # backtest sin ventaja en 1X2: no se recomiendan apuestas por diferencia con el casino
             else:
                 picks = self.value_calc.find_value_picks(prediction, odds_list, game)

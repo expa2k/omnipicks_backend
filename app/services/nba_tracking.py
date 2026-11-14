@@ -324,7 +324,8 @@ def _market_records(rows: List[NBAPredictionLog]) -> Dict:
 
 SPORT_MODELS = {"nba": ("nba_players_v2", ("nba_players_v2", "nba_possessions_v1")),
                 "nfl": ("nfl_v2", ("nfl_v2",)),
-                "soccer": ("soccer_v2", ("soccer_v2",))}
+                "soccer": ("soccer_v2", ("soccer_v2",)),
+                "mlb": ("mlb_v2", ("mlb_v2",))}
 
 
 def _soccer_probs(r) -> List[float]:
@@ -380,6 +381,8 @@ async def performance(db: AsyncSession, days: Optional[int] = None, sport: str =
     rows = (await db.execute(q.order_by(NBAPredictionLog.game_date.desc()))).scalars().all()
     if sport == "nfl":
         from app.services.nfl_v2 import abbr as abbr_fn
+    elif sport == "mlb":
+        abbr_fn = lambda n: "".join(w[0] for w in (n or "?").split()[-2:]).upper() if n else "?"
     else:
         abbr_fn = _abbr
     by_model: Dict[str, List[NBAPredictionLog]] = {}
@@ -412,7 +415,11 @@ async def performance(db: AsyncSession, days: Optional[int] = None, sport: str =
         "margin": r.home_pts - r.away_pts, "hit": (r.pred_margin > 0) == (r.home_pts > r.away_pts),
         "picks": log_picks(r),
     } for r in by_model.get(main, [])[:200]]
-    if sport == "nfl":
+    if sport == "mlb":
+        from app.services.mlb_v2 import BACKTEST as bt
+        backtest = {"games": bt["games"], "winner_pct": None, "logloss": bt["logloss"], "mae_margin": None,
+                    "mae_total": None, "logloss_market": bt["logloss_market"], "seasons": bt["seasons"]}
+    elif sport == "nfl":
         from app.services.nfl_v2 import load_params
         bt = (load_params() or {}).get("metrics") or {}
         backtest = {"games": bt.get("games"), "winner_pct": bt.get("winner_pct"), "logloss": None,

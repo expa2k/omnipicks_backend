@@ -34,7 +34,7 @@ Solo corre con el pipeline viejo, que está apagado. Acertó el ganador en 58.6%
 | 2 | Bullpen cansado y ventaja de mano | ✅ (efecto chico) |
 | 3 | Distribución de carreras (binomial negativa) → moneyline, run line y total | ✅ |
 | 4 | Backtest contra el cierre (2015–2021) | ✅ sin ventaja |
-| 5 | Producción: StatsAPI (abridores probables, alineaciones), ESPN (líneas), tareas automáticas y front | |
+| 5 | Producción: StatsAPI (abridores probables, alineaciones), ESPN (líneas), tareas automáticas y front | ✅ |
 
 ## Fase 0: fuentes (13-nov-2026, `app/services/mlb_history.py`)
 
@@ -104,3 +104,27 @@ Error del total ≈ 3.56–3.60 carreras.
 | Run line, confianza ≥ 60% | 6,092 · −4.6% | 3,302 · −2.2% |
 
 **Igual que en NFL y fútbol: no hay ventaja contra el cierre.** Se pierde más o menos el margen del casino. El total es lo más cercano a cero (−0.8% en 2019–2021, dentro del ruido). En la app, los picks del modelo se muestran con su confianza y se miden en vivo.
+
+## Fase 5: producción (13-nov-2026)
+
+- **Histórico reciente:** Retrosheet todavía no publica 2026. `load_statsapi_season` arma los mismos renglones desde la MLB StatsAPI (mes por mes: abridores, alineaciones, día o noche, parque y marcador; caché de 12 h). `load_all_games` usa Retrosheet hasta donde haya y la StatsAPI para lo demás. 2026 completo: todos los abridores y bateadores con id de Retrosheet.
+- **Equipos:** StatsAPI y ESPN → Retrosheet (`retro_team`: AZ→ARI, ATH→OAK, CHC→CHN, CWS→CHA, LAD→LAN…). Los 30 equipos de ESPN empatan.
+- **Predictor** (`app/services/mlb_v2.py`):
+  - Para cada juego, el abridor probable y la alineación salen de la StatsAPI del día. Si la alineación no está publicada, se usa la última del equipo.
+  - El modelo se reajusta cada 6 h.
+  - Devuelve el ganador (con entradas extra), las carreras esperadas, los abridores con su rating y la ventaja de mano.
+  - `mlb_picks`: ganador, run line y total con la probabilidad del modelo y su confianza, contra la línea y el momio de ESPN.
+- **Ingesta:** `DataIngestionService.ingest_mlb_espn` trae los juegos y momios de DraftKings (moneyline, run line y total) desde ESPN; los partidos se guardan como `espn_<id>`.
+- **Motor:**
+  - Los juegos de MLB de ESPN usan `mlb_v2`; los viejos de API-Sports siguen con el modelo anterior.
+  - La predicción se congela antes del juego y se liquida con el marcador de ESPN.
+  - No se generan "recomendados" por valor (el backtest no encontró ventaja).
+- **Scheduler:** `job_mlb` cada 30 min, de ayer a 2 días. Fuera de temporada (diciembre a mediados de febrero) no hace nada.
+- **API y front:**
+  - `GET /api/predictions/mlb/performance`.
+  - Pestaña MLB en el historial de Bankroll y en el panel en vivo.
+  - En la tarjeta, "Por qué este pronóstico" muestra los abridores, su rating, las carreras esperadas y la ventaja de mano.
+
+**Pendiente para cuando arranque la temporada 2027 (finales de marzo):**
+- Revisar en vivo que la StatsAPI publique abridores probables y alineaciones a tiempo.
+- Cuando Retrosheet publique 2026, la caché lo toma sola.

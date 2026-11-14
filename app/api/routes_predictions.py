@@ -195,7 +195,7 @@ async def get_game_predictions(
     # Lo que recomendó el modelo antes del partido (registro congelado), para los ya empezados
     from app.db_models import NBAPredictionLog
     logs = {r.game_id: r for r in (await db.execute(select(NBAPredictionLog).where(and_(
-        NBAPredictionLog.game_id.in_(game_ids), NBAPredictionLog.model_name.in_(("nba_players_v2", "nfl_v2", "soccer_v2")))))).scalars().all()}
+        NBAPredictionLog.game_id.in_(game_ids), NBAPredictionLog.model_name.in_(("nba_players_v2", "nfl_v2", "soccer_v2", "mlb_v2")))))).scalars().all()}
 
     # Logos (los manda ESPN; se guardan en la tabla de equipos)
     from app.db_models import Team
@@ -526,6 +526,17 @@ async def get_nba_performance(
     return await performance(db, days)
 
 
+@router.get("/mlb/performance")
+async def get_mlb_performance(
+    days: Optional[int] = Query(None, description="Solo los últimos N días"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Rendimiento en vivo de MLB v2 (mismo formato que /nba/performance)."""
+    from app.services.nba_tracking import performance, settle
+    await settle(db)
+    return await performance(db, days, sport="mlb")
+
+
 @router.get("/soccer/performance")
 async def get_soccer_performance(
     days: Optional[int] = Query(None, description="Solo los últimos N días"),
@@ -629,6 +640,20 @@ def _result(g, pred, frozen: Optional[dict] = None) -> Optional[dict]:
 def _model_picks(g, pred, odds_summary, log) -> Optional[dict]:
     """Lado que prefiere el modelo en ganador, spread y total, con su valor y, si terminó, el resultado.
     Para partidos ya empezados se usa la predicción congelada antes del inicio. NBA y NFL v2."""
+    if g.sport == SportType.MLB:
+        if pred is None:
+            return None
+        from app.services.mlb_v2 import mlb_picks
+        done = g.status == GameStatus.FINISHED and g.home_score is not None
+        teams = (g.raw_data or {}).get("teams") or {}
+        mp = mlb_picks(pred, odds_summary, g.home_team_name, g.away_team_name,
+                       teams.get("home", {}).get("abbreviation") or g.home_team_name[:3].upper(),
+                       teams.get("away", {}).get("abbreviation") or g.away_team_name[:3].upper(),
+                       g.home_score if done else None, g.away_score if done else None)
+        if mp is None:
+            return None
+        started = g.status != GameStatus.SCHEDULED or (g.game_time and g.game_time <= datetime.utcnow())
+        return {**mp, "frozen": bool(started)}
     if g.sport == SportType.SOCCER:
         if pred is None:
             return None

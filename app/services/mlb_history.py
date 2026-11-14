@@ -185,3 +185,90 @@ def load_odds(seasons: Iterable[int]) -> pl.DataFrame:
             except (ValueError, KeyError, TypeError):
                 continue
     return pl.DataFrame(out)
+
+
+STATSAPI_TO_RETRO = {"AZ": "ARI", "ARI": "ARI", "ATH": "OAK", "OAK": "OAK", "CHC": "CHN", "CWS": "CHA", "KC": "KCA",
+                     "LAA": "ANA", "LAD": "LAN", "NYM": "NYN", "NYY": "NYA", "SD": "SDN", "SF": "SFN", "STL": "SLN",
+                     "TB": "TBA", "WSH": "WAS", "CHW": "CHA", "WAS": "WAS", "KCR": "KCA", "SDP": "SDN", "SFG": "SFN",
+                     "TBR": "TBA"}
+
+
+def retro_team(abbr: str) -> str:
+    a = (abbr or "").upper()
+    return STATSAPI_TO_RETRO.get(a, a)
+
+
+def _mlbam_to_retro() -> Dict[str, str]:
+    reg = load_people()
+    return dict(zip(reg["mlbam_id"].to_list(), reg["retro_id"].to_list()))
+
+
+def parse_statsapi_game(g: Dict, m2r: Dict[str, str]) -> Dict:
+    """Un juego de la StatsAPI en el formato de los game logs (ids de Retrosheet; los jugadores nuevos
+    quedan como "mlbam:<id>")."""
+    pid = lambda p: m2r.get(str(p), f"mlbam:{p}") if p else ""
+    t = g["teams"]
+    lu = g.get("lineups") or {}
+    lineup = lambda side: ";".join(pid(p.get("id")) for p in lu.get(f"{side}Players", [])[:9])
+    return {"date": g.get("officialDate"), "game_num": str(g.get("gameNumber", 1)), "game_pk": g.get("gamePk"),
+            "away": retro_team(t["away"]["team"].get("abbreviation")), "home": retro_team(t["home"]["team"].get("abbreviation")),
+            "away_score": t["away"].get("score"), "home_score": t["home"].get("score"),
+            "status": (g.get("status") or {}).get("abstractGameState"),
+            "day_night": "N" if g.get("dayNight") == "night" else "D", "venue": str((g.get("venue") or {}).get("id", "")),
+            "away_sp_id": pid((t["away"].get("probablePitcher") or {}).get("id")),
+            "away_sp": (t["away"].get("probablePitcher") or {}).get("fullName"),
+            "home_sp_id": pid((t["home"].get("probablePitcher") or {}).get("id")),
+            "home_sp": (t["home"].get("probablePitcher") or {}).get("fullName"),
+            "away_lineup": lineup("away"), "home_lineup": lineup("home"),
+            "game_type": g.get("gameType")}
+
+
+def statsapi_games(start: str, end: str) -> List[Dict]:
+    import json
+    raw = _get(f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&startDate={start}&endDate={end}"
+               "&hydrate=probablePitcher,lineups,team,venue")
+    if not raw:
+        return []
+    m2r = _mlbam_to_retro()
+    return [parse_statsapi_game(g, m2r) for d in json.loads(raw).get("dates", []) for g in d.get("games", [])]
+
+
+def load_statsapi_season(season: int, max_age_hours: float = 12) -> pl.DataFrame:
+    """Juegos terminados de una temporada desde la StatsAPI (mes por mes), con el formato de los game logs.
+    Para las temporadas que Retrosheet todavía no publica (la actual y la anterior)."""
+    from datetime import date
+    path = os.path.join(CACHE_DIR, f"statsapi_{season}.parquet")
+    if os.path.exists(path) and os.path.getmtime(path) > time.time() - max_age_hours * 3600:
+        return pl.read_parquet(path)
+    rows = []
+    for mo in range(3, 12):
+        end_day = 30 if mo in (4, 6, 9, 11) else 31
+        rows += statsapi_games(f"{season}-{mo:02d}-01", f"{season}-{mo:02d}-{end_day}")
+    df = pl.DataFrame([r for r in rows if r["status"] == "Final" and r["game_type"] in ("R", "F", "D", "L", "W")
+                       and r["home_score"] is not None and r["home_lineup"].count(";") == 8])
+    if df.height:
+        # Parque: el de Retrosheet del equipo local (por su último año disponible); si no, el id del estadio
+        try:
+            last = load_gamelogs([season - 1])
+            park_of = dict(zip(last["home"].to_list(), last["park"].to_list()))
+        except Exception:
+            park_of = {}
+        df = df.with_columns(pl.col("date").str.strptime(pl.Date, "%Y-%m-%d"), pl.lit(season).alias("season"),
+                             pl.col("away_score").cast(pl.Float64), pl.col("home_score").cast(pl.Float64),
+                             pl.struct(["home", "venue"]).map_elements(lambda x: park_of.get(x["home"], "V" + x["venue"]),
+                                                                       return_dtype=pl.Utf8).alias("park"),
+                             pl.lit(None, dtype=pl.Float64).alias("away_pitchers"), pl.lit(None, dtype=pl.Float64).alias("home_pitchers"))
+        df.write_parquet(path)
+    return df
+
+
+def load_all_games(first: int, last: int) -> pl.DataFrame:
+    """Retrosheet hasta donde haya y la StatsAPI para lo que falte."""
+    frames = []
+    for y in range(first, last + 1):
+        g = load_gamelogs([y])
+        if g.height == 0:
+            g = load_statsapi_season(y)
+        if g.height:
+            frames.append(g)
+    return pl.concat(frames, how="diagonal_relaxed")

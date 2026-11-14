@@ -363,6 +363,42 @@ class DataIngestionService:
         logger.info(f"Fútbol (ESPN): {count} partidos para {target_date.isoformat()}")
         return count
 
+    async def ingest_mlb_espn(self, target_date: date) -> int:
+        """MLB v2: juegos del día desde ESPN (gratis), con marcador y momios de DraftKings (moneyline,
+        run line y total). Mismo parser que el fútbol (estructura de ESPN igual)."""
+        import httpx
+        from app.services.espn_nfl_client import parse_soccer_event
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.get("https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard",
+                                     params={"dates": target_date.strftime("%Y%m%d")})
+                events = r.json().get("events", []) if r.status_code == 200 else []
+        except Exception as e:
+            logger.warning(f"ESPN MLB: sin respuesta ({type(e).__name__}: {e})")
+            return 0
+        count = 0
+        for ev in events:
+            g = parse_soccer_event(ev)
+            if not g or not g["teams"]["home"]["id"] or not g["teams"]["away"]["id"]:
+                continue
+            th, ta = g["teams"]["home"], g["teams"]["away"]
+            home_team = await self._upsert_team(sport=SportType.MLB, external_id=f"espn_{th['id']}", name=th["name"],
+                                                short_name=th.get("abbreviation"), logo_url=th.get("logo"), league="MLB")
+            away_team = await self._upsert_team(sport=SportType.MLB, external_id=f"espn_{ta['id']}", name=ta["name"],
+                                                short_name=ta.get("abbreviation"), logo_url=ta.get("logo"), league="MLB")
+            game = await self._upsert_game(
+                sport=SportType.MLB, external_id=f"espn_{g['id']}", home_team=home_team, away_team=away_team,
+                game_date=target_date, game_time=self._parse_datetime(g.get("date")), league="MLB",
+                season=str(target_date.year), status=self._map_us_status(g["status"]["short"]),
+                venue=g["venue"]["name"] or None, home_score=g["scores"]["home"]["total"],
+                away_score=g["scores"]["away"]["total"], raw_data=g)
+            await self.db.flush()
+            self.odds_changed += await self._store_espn_odds(game, g.get("espn_odds"))
+            count += 1
+        await self.db.commit()
+        logger.info(f"MLB (ESPN): {count} juegos para {target_date.isoformat()}")
+        return count
+
     async def _store_espn_odds(self, game: Game, eo: Optional[Dict[str, Any]]) -> int:
         """Guarda las líneas de DraftKings que trae ESPN (moneyline, spread y total).
         Solo inserta una foto nueva si la línea cambió desde la última."""
