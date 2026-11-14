@@ -601,10 +601,20 @@ def nfl_picks(home_win_prob, pred_margin, pred_total, market_margin, market_tota
     d_tt = None if pred_total is None or market_total is None else pred_total - market_total
     # El lado lo deciden las métricas (la diferencia con la línea), nunca un empate en 50%
     tie = lambda p, d: p if p is None or d is None or abs(p - 0.5) > 1e-6 else 0.5 + (1e-6 if d > 0 else -1e-6 if d < 0 else 0)
+    # Probabilidad propia del modelo (sin calibrar contra la línea), para el pick y su confianza
+    raw_c = raw_o = None
+    p = load_params()
+    if p and d_sp is not None:
+        r_ = _dist(p).probs(pred_margin, -market_margin)
+        raw_c = r_["home_cover"] / max(1 - r_["push"], 1e-9)
+    if p and d_tt is not None:
+        t_ = total_probs(pred_total, p["sigma_total"], market_total)
+        raw_o = t_["over"] / max(1 - t_["push"], 1e-9)
     out = market_picks(home_win_prob, pred_margin, pred_total, market_margin, market_total, ml_home, ml_away,
                        sp_home_odds, sp_away_odds, over_odds, under_odds, home_pts, away_pts,
                        abbr(home_name), abbr(away_name), p_home_cover=tie(pr["home_cover"], d_sp),
-                       p_over=tie(pr["over"], d_tt), winner_recommendable=False)
+                       p_over=tie(pr["over"], d_tt), winner_recommendable=False,
+                       p_home_cover_raw=raw_c, p_over_raw=raw_o)
     # Cuántos puntos ve el modelo a favor del lado elegido, contra la línea
     if "spread" in out and d_sp is not None:
         out["spread"]["diff_pts"] = round(d_sp if out["spread"]["side"] == "home" else -d_sp, 1)

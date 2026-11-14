@@ -629,6 +629,17 @@ def _result(g, pred, frozen: Optional[dict] = None) -> Optional[dict]:
 def _model_picks(g, pred, odds_summary, log) -> Optional[dict]:
     """Lado que prefiere el modelo en ganador, spread y total, con su valor y, si terminó, el resultado.
     Para partidos ya empezados se usa la predicción congelada antes del inicio. NBA y NFL v2."""
+    if g.sport == SportType.SOCCER:
+        if pred is None:
+            return None
+        from app.services.soccer_v2 import soccer_picks
+        done = g.status == GameStatus.FINISHED and g.home_score is not None
+        sp = soccer_picks(pred, odds_summary, g.home_team_name, g.away_team_name,
+                          g.home_score if done else None, g.away_score if done else None)
+        if sp is None:
+            return None
+        started = g.status != GameStatus.SCHEDULED or (g.game_time and g.game_time <= datetime.utcnow())
+        return {**sp, "frozen": bool(started)}
     if g.sport == SportType.NBA:
         from app.services.nba_tracking import _abbr, market_picks
 

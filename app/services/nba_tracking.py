@@ -70,6 +70,13 @@ def _ncdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
+def confidence_tier(prob: Optional[float]) -> str:
+    """Qué tan seguro está el modelo de su pick (su propia probabilidad, sin comparar con la línea)."""
+    if prob is None:
+        return "sin_dato"
+    return "alta" if prob >= 0.60 else "media" if prob >= 0.55 else "baja"
+
+
 def pick_tier(edge: Optional[float]) -> str:
     """Mismos niveles que las recomendaciones: recomendado 3-10 pts, revisar >10, sin valor <3."""
     if edge is None:
@@ -93,7 +100,8 @@ def market_picks(home_win_prob: float, pred_margin: Optional[float], pred_total:
                  home_pts: Optional[int] = None, away_pts: Optional[int] = None,
                  home_abbr: str = "LOC", away_abbr: str = "VIS",
                  p_home_cover: Optional[float] = None, p_over: Optional[float] = None,
-                 winner_recommendable: bool = True) -> Dict:
+                 winner_recommendable: bool = True, p_home_cover_raw: Optional[float] = None,
+                 p_over_raw: Optional[float] = None) -> Dict:
     """Lado que prefiere el modelo en cada mercado, con su probabilidad, la del casino y el valor.
 
     Si se dan los puntos finales, marca el resultado: "win", "loss" o "push".
@@ -152,6 +160,22 @@ def market_picks(home_win_prob: float, pred_margin: Optional[float], pred_total:
         out["total"] = {"side": side, "label": f"{'Over' if side == 'over' else 'Under'} {market_total:g}", "line": market_total,
                         "prob": round(prob, 3), "odds": price, "odds_approx": approx, "implied": round(imp, 3),
                         "edge": round(prob - imp, 3), "tier": pick_tier(prob - imp), "result": res}
+    # Pick del modelo: su probabilidad propia (sin calibrar contra la línea) y su nivel de confianza
+    if "winner" in out:
+        out["winner"]["model_prob"] = out["winner"]["prob"]
+    if "spread" in out:
+        raw = p_home_cover_raw if p_home_cover_raw is not None else (p_home_cover if p_home_cover is not None else None)
+        if raw is None:
+            raw = out["spread"]["prob"] if out["spread"]["side"] == "home" else 1 - out["spread"]["prob"]
+        out["spread"]["model_prob"] = round(raw if out["spread"]["side"] == "home" else 1 - raw, 3)
+    if "total" in out:
+        raw = p_over_raw if p_over_raw is not None else (p_over if p_over is not None else None)
+        if raw is None:
+            raw = out["total"]["prob"] if out["total"]["side"] == "over" else 1 - out["total"]["prob"]
+        out["total"]["model_prob"] = round(raw if out["total"]["side"] == "over" else 1 - raw, 3)
+    for m in ("winner", "spread", "total"):
+        if m in out:
+            out[m]["confidence"] = confidence_tier(out[m].get("model_prob"))
     return out
 
 
@@ -261,9 +285,10 @@ def _market_records(rows: List[NBAPredictionLog]) -> Dict:
     out = {}
     picks = [log_picks(r) for r in rows]
     for m in ("winner", "spread", "total"):
-        for scope in ("all", "recommended"):
+        for scope in ("all", "recommended", "confident"):
             sel = [p[m] for p in picks if m in p and p[m]["result"] is not None
-                   and (scope == "all" or p[m]["tier"] == "recomendado")]
+                   and (scope == "all" or (scope == "recommended" and p[m]["tier"] == "recomendado")
+                        or (scope == "confident" and p[m].get("confidence") == "alta"))]
             w = sum(1 for x in sel if x["result"] == "win")
             l = sum(1 for x in sel if x["result"] == "loss")
             pu = sum(1 for x in sel if x["result"] == "push")

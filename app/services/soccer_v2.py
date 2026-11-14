@@ -167,3 +167,47 @@ def predict_games_sync(games: List[Tuple[int, str, str, str, bool]]) -> Dict[int
         except Exception as e:
             logger.warning(f"Fútbol v2: {home} vs {away} sin predicción ({type(e).__name__}: {e})")
     return out
+
+
+def soccer_picks(pred, odds_summary: Optional[Dict], home_name: str, away_name: str,
+                 home_goals: Optional[float] = None, away_goals: Optional[float] = None) -> Optional[Dict]:
+    """Picks del modelo en fútbol: resultado (1X2), más/menos 2.5 y ambos anotan, con la probabilidad del
+    modelo y su confianza. El valor contra el casino se muestra como dato, pero no se marca como
+    recomendado (el backtest no encontró ventaja)."""
+    from app.services.nba_tracking import _implied, confidence_tier
+    sd = getattr(pred, "simulation_details", None) or {}
+    if sd.get("model") != MODEL_NAME:
+        return None
+    o = odds_summary or {}
+    done = home_goals is not None and away_goals is not None
+    ab = lambda n: "".join(w[0] for w in (n or "?").split()[:3]).upper() if len((n or "").split()) > 1 else (n or "?")[:3].upper()
+
+    def item(label, side, prob, odds, won):
+        imp = _implied(odds) if odds is not None else None
+        return {"side": side, "label": label, "prob": round(prob, 3), "model_prob": round(prob, 3),
+                "confidence": confidence_tier(prob), "odds": odds, "implied": None if imp is None else round(imp, 3),
+                "edge": None if imp is None else round(prob - imp, 3), "tier": "sin_valor" if imp is not None else "sin_dato",
+                "result": None if not done else ("win" if won else "loss")}
+
+    probs = {"home": pred.home_win_prob or 0.0, "draw": pred.draw_prob or 0.0, "away": pred.away_win_prob or 0.0}
+    k = max(probs, key=probs.get)
+    lab = {"home": ab(home_name), "draw": "Empate", "away": ab(away_name)}[k]
+    odds = {"home": (o.get("best_home_ml") or {}).get("odds"), "draw": (o.get("best_draw") or {}).get("odds"),
+            "away": (o.get("best_away_ml") or {}).get("odds")}[k]
+    res = None if not done else ("home" if home_goals > away_goals else "draw" if home_goals == away_goals else "away")
+    out = {"winner": item(lab, k, probs[k], odds, res == k)}
+    p_over = sd.get("over_2_5")
+    if p_over is not None:
+        tt = o.get("total") or {}
+        line_ok = tt.get("line") == 2.5
+        over = p_over >= 0.5
+        out["total"] = item("Más de 2.5" if over else "Menos de 2.5", "over" if over else "under",
+                            p_over if over else 1 - p_over,
+                            (tt.get("over_odds") if over else tt.get("under_odds")) if line_ok else None,
+                            done and ((home_goals + away_goals > 2.5) == over))
+    p_b = sd.get("btts")
+    if p_b is not None:
+        yes = p_b >= 0.5
+        out["btts"] = item("Sí" if yes else "No", "yes" if yes else "no", p_b if yes else 1 - p_b, None,
+                           done and ((home_goals > 0 and away_goals > 0) == yes))
+    return out
