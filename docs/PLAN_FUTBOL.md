@@ -201,3 +201,30 @@ con cuasi-verosimilitud Poisson y gradiente analítico. El rho de los marcadores
   - calcular el valor con las probabilidades calibradas, y casi todo debería salir "sin valor";
   - **no recomendar el 1X2 por diferencias con el casino**, que es donde más se pierde;
   - medir en vivo, y probar contra líneas de apertura cuando haya datos (football-data trae apertura promedio desde 2019).
+
+## Fase 5: producción (13-nov-2026)
+
+- **Datos de los partidos:** ESPN, sin gastar la cuota de API-Sports (`DataIngestionService.ingest_soccer_espn`).
+  - 8 competencias: Premier, LaLiga, Serie A, Bundesliga, Ligue 1, Liga MX, Champions y Europa League (`SOCCER_V2_COMPETITIONS`).
+  - Trae equipos, logos, marcador, estado y momios de DraftKings: 1X2 con el **empate**, y total de goles.
+  - Los partidos se guardan con `external_id = espn_<id>`.
+- **Nombres ESPN → football-data:** las 6 ligas empatan al 100% en la temporada actual (alias agregados: Leeds, Coventry, Rayo, Paderborn, Chivas, Pumas, Santos, Atlético de San Luis…).
+- **Predictor** (`app/services/soccer_v2.py`):
+  - Ligas: Dixon-Coles (70% goles + 30% tiros a puerta en las 5 europeas; solo goles en la Liga MX).
+  - Copas: el modelo conjunto con fuerza por liga.
+  - 1X2 calibrado con temperatura: 0.90 en ligas y **0.95 en copas**. En copas el modelo ya está casi calibrado, y en favoritos de ≥80% exagera un poco (85.6% previsto contra 83.4% real), así que no conviene afilarlo más.
+  - Devuelve 1X2, goles esperados, marcador más probable, más de 2.5, ambos anotan y ratings (o la fuerza de liga en copas).
+  - Se reajusta cada 6 h (~15 s); el histórico de la temporada en curso se baja cada 12 h.
+- **Motor:**
+  - El fútbol de ESPN usa `soccer_v2`; los partidos viejos de API-Sports siguen con el modelo anterior.
+  - Se saltan las variables viejas, que gastaban la cuota de API-Sports.
+  - La predicción se congela antes del partido (`model_name = "soccer_v2"`) y se liquida con el marcador de ESPN.
+  - **No se generan picks**: el backtest no encontró ventaja en el 1X2.
+- **Scheduler:** `job_soccer` cada hora (de ayer a 7 días: marcadores, momios y predicciones).
+- **Front:** "Por qué este pronóstico" con goles esperados, ataque y defensa (o liga y fuerza de liga en copas), marcador más probable, más de 2.5 y ambos anotan. Incluye la nota de que es un pronóstico, no una apuesta.
+
+**Pendiente:**
+- Historial y rendimiento en vivo del fútbol en la app (como la NBA y la NFL).
+- Separar "otras ligas" por país.
+- xG de football-data cuando se junte la temporada.
+- Alineaciones y bajas (fase 6, opcional).

@@ -332,6 +332,37 @@ class DataIngestionService:
         logger.info(f"Ingested {count} NBA games from ESPN for {target_date.isoformat()}")
         return count
 
+    async def ingest_soccer_espn(self, target_date: date) -> int:
+        """Fútbol v2: partidos de las 8 competencias de la app desde ESPN (gratis), con marcador y
+        momios de DraftKings (1X2 y total). La fecha del partido es la del día ET de la patada inicial."""
+        from zoneinfo import ZoneInfo
+        from datetime import timezone
+        from app.services.espn_nfl_client import SOCCER_V2_COMPETITIONS, get_soccer_games_espn, parse_soccer_event
+        count = 0
+        for slug, league in SOCCER_V2_COMPETITIONS.items():
+            for ev in await get_soccer_games_espn(slug, target_date):
+                g = parse_soccer_event(ev)
+                if not g or not g["teams"]["home"]["id"] or not g["teams"]["away"]["id"]:
+                    continue
+                th, ta = g["teams"]["home"], g["teams"]["away"]
+                home_team = await self._upsert_team(sport=SportType.SOCCER, external_id=f"espn_{th['id']}", name=th["name"],
+                                                    short_name=th.get("abbreviation"), logo_url=th.get("logo"), league=league)
+                away_team = await self._upsert_team(sport=SportType.SOCCER, external_id=f"espn_{ta['id']}", name=ta["name"],
+                                                    short_name=ta.get("abbreviation"), logo_url=ta.get("logo"), league=league)
+                kick = self._parse_datetime(g.get("date"))
+                day = kick.replace(tzinfo=timezone.utc).astimezone(ZoneInfo("America/New_York")).date() if kick else target_date
+                game = await self._upsert_game(
+                    sport=SportType.SOCCER, external_id=f"espn_{g['id']}", home_team=home_team, away_team=away_team,
+                    game_date=day, game_time=kick, league=league, season=str(day.year if day.month >= 7 else day.year - 1),
+                    status=self._map_us_status(g["status"]["short"]), venue=g["venue"]["name"] or None,
+                    home_score=g["scores"]["home"]["total"], away_score=g["scores"]["away"]["total"], raw_data=g)
+                await self.db.flush()
+                self.odds_changed += await self._store_espn_odds(game, g.get("espn_odds"))
+                count += 1
+        await self.db.commit()
+        logger.info(f"Fútbol (ESPN): {count} partidos para {target_date.isoformat()}")
+        return count
+
     async def _store_espn_odds(self, game: Game, eo: Optional[Dict[str, Any]]) -> int:
         """Guarda las líneas de DraftKings que trae ESPN (moneyline, spread y total).
         Solo inserta una foto nueva si la línea cambió desde la última."""
@@ -340,7 +371,10 @@ class DataIngestionService:
         book = "DraftKings"
         wanted = []
         if eo.get("ml_home") is not None and eo.get("ml_away") is not None:
-            wanted.append((MarketType.MONEYLINE, {"home_odds": eo["ml_home"], "away_odds": eo["ml_away"]}))
+            ml = {"home_odds": eo["ml_home"], "away_odds": eo["ml_away"]}
+            if eo.get("ml_draw") is not None:
+                ml["draw_odds"] = float(eo["ml_draw"])
+            wanted.append((MarketType.MONEYLINE, ml))
         if eo.get("spread_home_line") is not None:
             wanted.append((MarketType.SPREAD, {"spread_home": eo["spread_home_line"], "spread_home_odds": eo.get("spread_home_odds"),
                                               "spread_away_odds": eo.get("spread_away_odds")}))
@@ -564,7 +598,7 @@ class DataIngestionService:
     def _map_us_status(self, status_str: str) -> GameStatus:
         status_str = str(status_str).lower()
         if status_str in ["ns", "sched"]: return GameStatus.SCHEDULED
-        if status_str in ["q1", "q2", "q3", "q4", "ht", "live"]: return GameStatus.LIVE
+        if status_str in ["q1", "q2", "q3", "q4", "ht", "live", "p"]: return GameStatus.LIVE
         if status_str in ["ft", "aot"]: return GameStatus.FINISHED
         if status_str in ["pst"]: return GameStatus.POSTPONED
         if status_str in ["canc"]: return GameStatus.CANCELLED

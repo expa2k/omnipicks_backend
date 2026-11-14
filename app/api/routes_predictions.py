@@ -195,7 +195,7 @@ async def get_game_predictions(
     # Lo que recomendó el modelo antes del partido (registro congelado), para los ya empezados
     from app.db_models import NBAPredictionLog
     logs = {r.game_id: r for r in (await db.execute(select(NBAPredictionLog).where(and_(
-        NBAPredictionLog.game_id.in_(game_ids), NBAPredictionLog.model_name.in_(("nba_players_v2", "nfl_v2")))))).scalars().all()}
+        NBAPredictionLog.game_id.in_(game_ids), NBAPredictionLog.model_name.in_(("nba_players_v2", "nfl_v2", "soccer_v2")))))).scalars().all()}
 
     # Logos (los manda ESPN; se guardan en la tabla de equipos)
     from app.db_models import Team

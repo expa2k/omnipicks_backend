@@ -260,6 +260,31 @@ async def job_injury_tick():
     await job_sync_injuries()
 
 
+async def job_soccer():
+    """Fútbol v2: partidos de ayer a 7 días desde ESPN (marcadores y momios) y predicciones."""
+    from sqlalchemy import select, distinct
+    from app.db_models import Game, GameStatus, SportType
+    from app.services.data_ingestion import DataIngestionService
+    from app.services.prediction_engine import PredictionEngine
+    try:
+        today = today_et()
+        n = 0
+        for k in range(-1, 8):
+            async with get_session_factory()() as db:
+                n += await DataIngestionService(db).ingest_soccer_espn(today + timedelta(days=k))
+        async with get_session_factory()() as db:
+            days = (await db.execute(select(distinct(Game.game_date)).where(
+                Game.sport == SportType.SOCCER, Game.status == GameStatus.SCHEDULED, Game.external_id.like("espn_%"),
+                Game.game_time > datetime.utcnow(), Game.game_time < datetime.utcnow() + timedelta(days=8)))).scalars().all()
+        for day in sorted(days):
+            async with _predict_lock, get_session_factory()() as db:
+                await PredictionEngine(db).run_predictions_for_date(day, sports=[SportType.SOCCER])
+        await settle_predictions()
+        logger.info(f"⚽ Fútbol: {n} partidos (ayer a 7 días); predicciones de {len(days)} días")
+    except Exception as e:
+        logger.warning(f"Fútbol: no se pudo actualizar ({type(e).__name__}: {e})")
+
+
 # NFL: los inactivos oficiales salen 90 min antes del partido. Cada 10 min en las 2 horas previas a
 # algún partido; cada hora el resto del tiempo.
 NFL_NEAR_MINUTES = 120
@@ -297,10 +322,12 @@ def start_nba_scheduler() -> Optional[AsyncIOScheduler]:
     _scheduler.add_job(job_injury_tick, IntervalTrigger(minutes=5), id="nba_injuries", **common)
     _scheduler.add_job(job_update_history, CronTrigger(hour=4, minute=30), id="nba_history", **common)
     _scheduler.add_job(job_nfl_tick, IntervalTrigger(minutes=5), id="nfl", **common)
+    _scheduler.add_job(job_soccer, IntervalTrigger(minutes=60), id="soccer", **common)
     _scheduler.start()
     asyncio.get_running_loop().create_task(job_startup())            # ponerse al día al arrancar
     asyncio.get_running_loop().create_task(_nfl_startup())
-    logger.info("🏀 Tareas NBA programadas: lesiones cada 10 min cerca de los partidos (30 min el resto), histórico diario 04:30 ET; NFL cada 10 min en las 2 h previas a un partido (cada hora el resto)")
+    asyncio.get_running_loop().create_task(job_soccer())
+    logger.info("🏀 Tareas NBA programadas: lesiones cada 10 min cerca de los partidos (30 min el resto), histórico diario 04:30 ET; NFL cada 10 min en las 2 h previas a un partido (cada hora el resto); fútbol cada hora")
     return _scheduler
 
 

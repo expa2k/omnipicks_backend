@@ -53,8 +53,8 @@ def _day(slug: str, d: date) -> List[Dict]:
 def load_cup_season(slug: str, season: int, pause: float = 0.25) -> pl.DataFrame:
     """Una temporada de una copa (de julio de `season` a junio siguiente). Las cerradas se guardan."""
     path = os.path.join(CACHE_DIR, f"cup_{slug}_{season}.parquet")
-    if os.path.exists(path) and season < current_season_start():
-        return pl.read_parquet(path)
+    if os.path.exists(path) and (season < current_season_start() or os.path.getmtime(path) > time.time() - 12 * 3600):
+        return pl.read_parquet(path)        # la temporada en curso se vuelve a bajar cada 12 h
     rows: List[Dict] = []
     d, end = date(season, 7, 1), min(date(season + 1, 6, 15), date.today())
     while d <= end:
@@ -112,6 +112,11 @@ ALIASES = {  # ESPN (normalizado) → football-data
     "brighton hove albion": "Brighton", "fc cologne": "FC Koln", "hertha berlin": "Hertha",
     "saint etienne": "St Etienne", "vitoria de guimaraes": "Guimaraes", "fc augsburg": "Augsburg",
     "werder bremen": "Werder Bremen", "hamburg sv": "Hamburg", "athletic club bilbao": "Ath Bilbao",
+    "coventry city": "Coventry", "hull city": "Hull", "ipswich town": "Ipswich", "leeds united": "Leeds",
+    "deportivo": "La Coruna", "deportivo la coruna": "La Coruna", "racing santander": "Santander",
+    "rayo vallecano": "Vallecano", "sc paderborn 07": "Paderborn", "aj auxerre": "Auxerre",
+    "atletico de san luis": "Atl. San Luis", "guadalajara": "Guadalajara Chivas", "chivas": "Guadalajara Chivas",
+    "pumas unam": "UNAM Pumas", "santos": "Santos Laguna", "santos laguna": "Santos Laguna",
 }
 _DROP = {"fc", "cf", "ac", "sc", "afc", "ssc", "as", "rc", "cd", "ud", "sv", "vfl", "vfb", "tsg", "1", "club", "de", "the"}
 

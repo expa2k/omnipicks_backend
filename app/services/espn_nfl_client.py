@@ -289,3 +289,48 @@ def _parse_espn_soccer_stats(data: Dict) -> Dict[str, float]:
                 except (ValueError, TypeError):
                     pass
     return metrics
+
+
+# Competencias de fútbol que salen en la app (fútbol v2): slug de ESPN → nombre en la app
+SOCCER_V2_COMPETITIONS = {
+    "eng.1": "Premier League", "esp.1": "La Liga", "ita.1": "Serie A", "ger.1": "Bundesliga",
+    "fra.1": "Ligue 1", "mex.1": "Liga MX", "uefa.champions": "UEFA Champions League",
+    "uefa.europa": "UEFA Europa League",
+}
+_SOCCER_STATUS = {"STATUS_SCHEDULED": "NS", "STATUS_FULL_TIME": "FT", "STATUS_FINAL": "FT",
+                  "STATUS_FINAL_AET": "FT", "STATUS_FINAL_PEN": "FT", "STATUS_POSTPONED": "PST",
+                  "STATUS_CANCELED": "CANC", "STATUS_ABANDONED": "CANC"}
+
+
+def parse_soccer_event(e: Dict) -> Optional[Dict]:
+    """Un partido del scoreboard de ESPN en el formato de la ingesta (equipos, marcador, estado y momios
+    de DraftKings: 1X2 y total de goles)."""
+    from app.services.espn_nba_client import espn_odds
+    try:
+        c = e["competitions"][0]
+        teams = {x.get("homeAway"): x for x in c.get("competitors", [])}
+        h, a = teams.get("home", {}), teams.get("away", {})
+        st = c.get("status", {}).get("type", {})
+        name = st.get("name", "STATUS_SCHEDULED")
+        done = bool(st.get("completed"))
+        short = _SOCCER_STATUS.get(name, "FT" if done else ("P" if st.get("state") == "in" else "NS"))
+        odds = (c.get("odds") or [{}])[0]
+        eo = espn_odds(odds)
+        if eo is not None:
+            eo["ml_draw"] = (odds.get("drawOdds") or {}).get("moneyLine")
+            if eo.get("ml_home") is None:
+                eo["ml_home"] = (odds.get("homeTeamOdds") or {}).get("moneyLine")
+                eo["ml_away"] = (odds.get("awayTeamOdds") or {}).get("moneyLine")
+        def team(x):
+            t = x.get("team", {})
+            return {"id": t.get("id"), "name": t.get("displayName"), "abbreviation": t.get("abbreviation"),
+                    "logo": t.get("logo") or (t.get("logos") or [{}])[0].get("href")}
+        score = lambda x: float(x["score"]) if (done or short == "P") and x.get("score") not in (None, "") else None
+        return {"id": e.get("id"), "date": e.get("date"), "status": {"short": short, "espn": name},
+                "venue": {"name": (c.get("venue") or {}).get("fullName")}, "neutral": bool(c.get("neutralSite")),
+                "teams": {"home": team(h), "away": team(a)},
+                "scores": {"home": {"total": score(h)}, "away": {"total": score(a)}},
+                "espn_odds": eo, "_source": "espn"}
+    except (KeyError, IndexError, TypeError, ValueError) as ex:
+        logger.warning(f"ESPN Soccer: evento ilegible ({type(ex).__name__}: {ex})")
+        return None
