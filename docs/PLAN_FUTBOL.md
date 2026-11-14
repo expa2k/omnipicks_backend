@@ -71,3 +71,41 @@ Todas están al día: los últimos partidos son del 6–9 de noviembre de 2026.
 - **Sin xG histórico.** Los ratings de la fase 2 se arman con **tiros y tiros a puerta** (desde 2010 en las 5 grandes y la Championship), que es la aproximación estándar. El xG de football-data se usa desde 2026 a medida que se junte.
 - **Comparación contra el mercado:** el cierre de Pinnacle desde 2012 en todas las ligas.
 - **Liga MX y las ligas de América:** solo resultados y momios 1X2. Ahí el modelo será Dixon-Coles con goles.
+
+## Fase 1: Dixon-Coles (`app/services/soccer_dc.py`, `ml/scripts/soccer_dc_eval.py`)
+
+**Modelo:**
+
+    λ_local = exp(μ + localía + ataque[local] − defensa[visitante])
+    λ_visitante = exp(μ + ataque[visitante] − defensa[local])
+
+- Poisson con la corrección de Dixon-Coles para 0-0, 1-0, 0-1 y 1-1.
+- Máxima verosimilitud con peso exp(−ξ·días) y ridge en ataque y defensa.
+- Una liga a la vez, con los partidos de los últimos ~3 años.
+- De la matriz de marcadores salen 1X2, goles esperados, más/menos 2.5 y ambos anotan.
+
+**Backtest:** semana a semana, cada semana se ajusta solo con los partidos anteriores. Se compara contra:
+- la base: frecuencias de 1X2 de la liga en las temporadas previas;
+- **Pinnacle al cierre**, sin margen.
+
+**Parámetros** (elegidos con 2019–2021): ξ = 0.002 por día (vida media ≈ 1 año), ridge = 2. Probé ξ 0.001/0.002/0.0035 × ridge 0.5/2/6; el rango completo de log loss fue de 1.0024 a 1.0065.
+
+**Resultado** (log loss del 1X2, menor es mejor):
+
+| Liga | 2019–21 base | 2019–21 modelo | 2019–21 Pinnacle | 2022–26 base | **2022–26 modelo** | 2022–26 Pinnacle |
+|---|---|---|---|---|---|---|
+| Premier League | 1.076 | 0.982 | 0.969 | 1.068 | **0.987** | 0.950 |
+| La Liga | 1.081 | 1.000 | 0.982 | 1.063 | **0.977** | 0.956 |
+| Serie A | 1.086 | 0.977 | 0.955 | 1.085 | **0.982** | 0.968 |
+| Bundesliga | 1.074 | 1.001 | 0.979 | 1.072 | **0.994** | 0.968 |
+| Ligue 1 | 1.084 | 1.016 | 0.994 | 1.072 | **0.998** | 0.976 |
+| Liga MX | 1.074 | 1.046 | 1.033 | 1.069 | **1.017** | 0.987 |
+| **Todas** | 1.079 | 1.002 | 0.984 | 1.071 | **0.992** | 0.967 |
+
+En 2022–26, el Brier del modelo es 0.592 contra 0.575 de Pinnacle; el log loss del marcador exacto, 2.93; y el error de goles totales, 1.32 goles por partido.
+
+**Qué dice:**
+- Dixon-Coles queda **muy por encima de la base** (−0.08 de log loss) y a **0.025 de Pinnacle**. Eso es lo esperable para un modelo de goles bien hecho; los modelos públicos buenos suelen quedar a 0.01–0.03 del cierre.
+- El modelo actual de la app (sin topes, muestras de 1–3 partidos) no se puede ni comparar, porque daba marcadores como 1.07–15.38.
+- En la Liga MX el modelo está más lejos del mercado (0.030). Allí los torneos cortos y la liguilla hacen todo más ruidoso; es candidata a ajustes propios (por ejemplo, un descuento más rápido).
+- **Siguiente (fase 2):** ratings con tiros y tiros a puerta en las 5 ligas europeas, que suelen predecir mejor que los goles.
