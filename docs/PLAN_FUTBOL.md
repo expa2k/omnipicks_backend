@@ -136,3 +136,39 @@ con cuasi-verosimilitud Poisson y gradiente analítico. El rho de los marcadores
 ## Copas europeas: histórico (`app/services/soccer_cups.py`)
 
 **4,711 partidos** de Champions y Europa League de 2016 a 2026, bajados de ESPN día por día (martes a jueves) y guardados por temporada. Son la base de la fase 3: los cruces entre clubes de distintas ligas.
+
+## Fase 3: Champions y Europa League (`app/services/soccer_joint.py`, `ml/scripts/soccer_cups_eval.py`)
+
+**Nombres:** `soccer_cups.match_names` empareja ESPN con football-data. Normaliza (acentos, "FC", "AC"…), usa una lista de alias (Man City, Ath Madrid, Sp Lisbon, M'gladbach…) y solo acepta coincidencias muy seguras (≥ 0.88). Los clubes de ligas que no tenemos (Celtic, Salzburgo, Shakhtar, Galatasaray…) quedan como equipos propios dentro del grupo **"otras ligas"**.
+
+**Modelo conjunto:** un solo ajuste con las 8 ligas europeas y las copas,
+
+    λ = exp(μ_competición + localía_competición + ataque[eq] + A[su liga] − defensa[rival] − D[liga del rival])
+
+- La fuerza por liga (A y D) se aprende de los cruces en las copas.
+- Dentro de una liga, A − D se confunde con su μ, así que solo ordena las ligas entre sí.
+- Objetivo: 70% goles + 30% tiros a puerta en las ligas; solo goles en copas.
+- Ridge 2 en los equipos y 5 en las ligas; ξ = 0.002; 3 años de historia; rho = −0.05.
+
+**Resultado** (2,718 partidos de copa de 2019–2026, semana a semana; log loss del 1X2):
+
+| Partidos | Base | Solo ligas (todas las ligas iguales) | **Conjunto** |
+|---|---|---|---|
+| Todos (2,718) | 1.046 | 0.986 | **0.946** |
+| Champions (1,144) | 1.043 | 0.938 | **0.907** |
+| Europa League (1,574) | 1.049 | 1.020 | **0.974** |
+| Los dos equipos de nuestras ligas (884) | 1.047 | 1.019 | **0.978** |
+| Uno de nuestras ligas y otro de fuera (1,112) | 1.037 | 0.910 | **0.872** |
+| Los dos de otras ligas (722) | 1.060 | 1.060 | **1.020** |
+| 2019–2021 | 1.064 | 1.004 | **0.960** |
+| 2022–2026 | 1.031 | 0.969 | **0.933** |
+
+**Fuerza por liga hoy** (A + D, en escala logarítmica de goles): Premier +0.64 · Bundesliga +0.13 · LaLiga +0.12 · Serie A +0.10 · Ligue 1 −0.02 · Championship −0.12 · Portugal −0.18 · otras ligas −0.25 · Eredivisie −0.42.
+
+**Qué dice:**
+- **Tomar en cuenta la fuerza de cada liga mejora mucho las copas**: −0.04 de log loss contra tratar a todas las ligas iguales, y −0.10 contra la base. Mejora en las dos competencias y en los dos periodos.
+- Donde más se nota es en los partidos entre un club de nuestras ligas y uno de fuera (0.872).
+- Los partidos entre dos clubes de "otras ligas" (las fases previas) siguen difíciles: 1.02.
+- No hay momios históricos de copas para comparar contra el mercado. Se medirá en vivo con los momios de ESPN.
+- El valor de "otras ligas" mezcla ligas muy distintas (Turquía con Islas Feroe). Mejora posible: separar por país con ESPN (ligas de Portugal, Bélgica, Turquía, Escocia…), o usar ClubElo cuando vuelva.
+- **Decisión:** las copas usan el modelo conjunto; las ligas siguen con el Dixon-Coles de las fases 1 y 2.

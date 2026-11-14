@@ -75,3 +75,78 @@ def load_cup_season(slug: str, season: int, pause: float = 0.25) -> pl.DataFrame
 def load_cups(first_season: int = 2016) -> pl.DataFrame:
     frames = [load_cup_season(s, y) for s in CUPS for y in range(first_season, current_season_start() + 1)]
     return pl.concat([f for f in frames if f.height], how="diagonal_relaxed")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Nombres de ESPN → nombres de football-data
+# ══════════════════════════════════════════════════════════════════════
+
+import re
+import unicodedata
+from difflib import SequenceMatcher
+
+ALIASES = {  # ESPN (normalizado) → football-data
+    "internazionale": "Inter", "inter milan": "Inter", "milan": "Milan", "bayern munich": "Bayern Munich",
+    "borussia dortmund": "Dortmund", "borussia monchengladbach": "M'gladbach", "bayer leverkusen": "Leverkusen",
+    "eintracht frankfurt": "Ein Frankfurt", "paris saint germain": "Paris SG", "sporting cp": "Sp Lisbon",
+    "sporting lisbon": "Sp Lisbon", "braga": "Sp Braga", "sporting braga": "Sp Braga", "real betis": "Betis",
+    "real sociedad": "Sociedad", "celta vigo": "Celta", "wolverhampton wanderers": "Wolves",
+    "tottenham hotspur": "Tottenham", "psv eindhoven": "PSV Eindhoven", "az alkmaar": "AZ Alkmaar",
+    "ajax amsterdam": "Ajax", "feyenoord rotterdam": "Feyenoord", "vitoria guimaraes": "Guimaraes",
+    "atletico madrid": "Ath Madrid", "athletic club": "Ath Bilbao", "athletic bilbao": "Ath Bilbao",
+    "manchester city": "Man City", "manchester united": "Man United", "newcastle united": "Newcastle",
+    "west ham united": "West Ham", "leicester city": "Leicester", "brighton and hove albion": "Brighton",
+    "nottingham forest": "Nott'm Forest", "rb leipzig": "RB Leipzig", "1899 hoffenheim": "Hoffenheim",
+    "tsg hoffenheim": "Hoffenheim", "vfl wolfsburg": "Wolfsburg", "sc freiburg": "Freiburg", "vfb stuttgart": "Stuttgart",
+    "union berlin": "Union Berlin", "fc koln": "FC Koln", "olympique lyonnais": "Lyon", "lyon": "Lyon",
+    "olympique de marseille": "Marseille", "marseille": "Marseille", "as monaco": "Monaco", "losc lille": "Lille",
+    "lille": "Lille", "stade rennais": "Rennes", "rennes": "Rennes", "ogc nice": "Nice", "rc lens": "Lens",
+    "stade brestois 29": "Brest", "brest": "Brest", "as roma": "Roma", "ss lazio": "Lazio", "ssc napoli": "Napoli",
+    "napoli": "Napoli", "juventus": "Juventus", "atalanta": "Atalanta", "fiorentina": "Fiorentina", "bologna": "Bologna",
+    "villarreal": "Villarreal", "sevilla": "Sevilla", "valencia": "Valencia", "getafe": "Getafe", "granada": "Granada",
+    "espanyol": "Espanol", "girona": "Girona", "benfica": "Benfica", "porto": "Porto", "fc porto": "Porto",
+    "twente": "Twente", "fc twente": "Twente", "utrecht": "Utrecht", "fc utrecht": "Utrecht", "pec zwolle": "Zwolle",
+    "vitesse": "Vitesse", "rangers": None, "celtic": None, "real madrid": "Real Madrid", "barcelona": "Barcelona",
+    "arsenal": "Arsenal", "chelsea": "Chelsea", "liverpool": "Liverpool", "everton": "Everton",
+    "aston villa": "Aston Villa", "burnley": "Burnley", "west bromwich albion": "West Brom",
+    "brighton hove albion": "Brighton", "fc cologne": "FC Koln", "hertha berlin": "Hertha",
+    "saint etienne": "St Etienne", "vitoria de guimaraes": "Guimaraes", "fc augsburg": "Augsburg",
+    "werder bremen": "Werder Bremen", "hamburg sv": "Hamburg", "athletic club bilbao": "Ath Bilbao",
+}
+_DROP = {"fc", "cf", "ac", "sc", "afc", "ssc", "as", "rc", "cd", "ud", "sv", "vfl", "vfb", "tsg", "1", "club", "de", "the"}
+
+
+def _norm(s: str) -> str:
+    s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode().lower()
+    s = re.sub(r"[^a-z0-9 ]", " ", s.replace("'", "").replace(".", " ").replace("-", " "))
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _core(s: str) -> str:
+    return " ".join(t for t in _norm(s).split() if t not in _DROP)
+
+
+def match_names(espn_names, fd_names) -> Dict[str, str]:
+    """ESPN → football-data. Solo empareja con mucha confianza; lo demás queda fuera (grupo "otras ligas")."""
+    fd = list(fd_names)
+    fd_core = {f: _core(f) for f in fd}
+    out = {}
+    for e in espn_names:
+        n = _norm(e)
+        if n in ALIASES:
+            if ALIASES[n] in fd:
+                out[e] = ALIASES[n]
+            continue
+        c = _core(e)
+        exact = [f for f, fc in fd_core.items() if fc == c or _norm(f) == n]
+        if exact:
+            out[e] = exact[0]
+            continue
+        best, score = None, 0.0
+        for f, fc in fd_core.items():
+            r = SequenceMatcher(None, c, fc).ratio()
+            if r > score:
+                best, score = f, r
+        if best is not None and score >= 0.88:
+            out[e] = best
+    return out
