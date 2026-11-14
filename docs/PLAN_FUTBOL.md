@@ -237,3 +237,20 @@ con cuasi-verosimilitud Poisson y gradiente analítico. El rho de los marcadores
 - Separar "otras ligas" por país.
 - xG de football-data cuando se junte la temporada.
 - Alineaciones y bajas (fase 6, opcional).
+
+## Selecciones: UEFA y Concacaf Nations League (13-nov-2026)
+
+- **Datos:** todos los partidos internacionales desde 1872 (49,940; base pública `martj42/international_results` en GitHub), con torneo y si se jugó en cancha neutral. Se bajan cada 12 h (`app/services/soccer_national.py`).
+- **Modelo:** el mismo Dixon-Coles (`fit_rates` acepta ahora cancha neutral y pesos por partido), con ξ = 0.0005 (vida media ≈ 3.8 años), ridge 1 y ~8 años de historia. Los amistosos pesan igual: bajarles el peso empeoraba.
+- **Backtest** (mes a mes, 2022–2026; log loss del 1X2):
+
+| Partidos | Cuántos | Base | **Modelo** |
+|---|---|---|---|
+| Todos los oficiales | 3,717 | 1.050 | **0.857** |
+| UEFA Nations League | 454 | 1.088 | **0.946** |
+| Concacaf Nations League | 389 | 1.027 | **0.846** |
+| Eliminatorias mundialistas | 1,001 | 1.041 | **0.787** |
+| Mundial 2022 y 2026 | 168 | 1.074 | **0.922** |
+
+- **Contra el modelo viejo en el Mundial 2026** (365 pronósticos de partidos terminados; el viejo mezclaba la simulación propia con Bzzoiro): log loss **1.315 → 0.989**, y acierto del resultado **52.1% → 55.1%**.
+- **En la app:** ESPN `uefa.nations` y `concacaf.nations.league`; los nombres de ESPN se pasan a los de la base con alias (Türkiye, Czechia, St. Lucia…). Sin temperatura (T = 1).

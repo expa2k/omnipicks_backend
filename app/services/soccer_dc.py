@@ -135,7 +135,8 @@ GOALS_PER_SOT = 0.289      # calibrado con 2010–2018 en las 5 grandes (los tir
 
 
 def fit_rates(home: List[str], away: List[str], yh: np.ndarray, ya: np.ndarray, days_ago: np.ndarray,
-              params: DCParams = DCParams(), init: Optional[DCFit] = None, rho: float = 0.0) -> DCFit:
+              params: DCParams = DCParams(), init: Optional[DCFit] = None, rho: float = 0.0,
+              neutral: Optional[np.ndarray] = None, weight: Optional[np.ndarray] = None) -> DCFit:
     """Ataque, defensa, media y localía con objetivos continuos (cuasi-Poisson: y·log λ − λ), para
     mezclar goles reales con goles esperados por tiros. Sin corrección de marcadores bajos: el `rho`
     se toma del ajuste con goles."""
@@ -143,6 +144,9 @@ def fit_rates(home: List[str], away: List[str], yh: np.ndarray, ya: np.ndarray, 
     home = [h for h, k in zip(home, m) if k]
     away = [a for a, k in zip(away, m) if k]
     yh, ya, w = yh[m], ya[m], np.exp(-params.xi * days_ago[m])
+    if weight is not None:
+        w = w * weight[m]
+    hn = np.ones(len(yh)) if neutral is None else 1.0 - neutral[m].astype(float)   # sede neutral: sin localía
     teams = sorted(set(home) | set(away))
     idx = {t: k for k, t in enumerate(teams)}
     hi = np.array([idx[t] for t in home])
@@ -151,7 +155,7 @@ def fit_rates(home: List[str], away: List[str], yh: np.ndarray, ya: np.ndarray, 
 
     def nll_grad(p):
         att, dfn, mu, hfa = p[:n], p[n:2 * n], p[2 * n], p[2 * n + 1]
-        lh = np.exp(mu + hfa + att[hi] - dfn[ai])
+        lh = np.exp(mu + hfa * hn + att[hi] - dfn[ai])
         la = np.exp(mu + att[ai] - dfn[hi])
         f = -np.sum(w * (yh * np.log(lh) - lh + ya * np.log(la) - la)) + params.ridge * (att @ att + dfn @ dfn)
         rh, ra = w * (lh - yh), w * (la - ya)          # derivada respecto a log λ
@@ -159,7 +163,7 @@ def fit_rates(home: List[str], away: List[str], yh: np.ndarray, ya: np.ndarray, 
         g[:n] = np.bincount(hi, rh, n) + np.bincount(ai, ra, n) + 2 * params.ridge * att
         g[n:2 * n] = -np.bincount(ai, rh, n) - np.bincount(hi, ra, n) + 2 * params.ridge * dfn
         g[2 * n] = rh.sum() + ra.sum()
-        g[2 * n + 1] = rh.sum()
+        g[2 * n + 1] = (rh * hn).sum()
         return f, g
 
     p0 = np.zeros(2 * n + 2)

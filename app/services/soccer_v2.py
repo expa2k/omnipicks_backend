@@ -34,6 +34,7 @@ TEMPERATURE_CUPS = 0.95     # copas: casi calibrado; en favoritos ≥80% exagera
 SHOTS_LEAGUES = {"Premier League", "La Liga", "Serie A", "Bundesliga", "Ligue 1"}
 LEAGUES = ["Premier League", "La Liga", "Serie A", "Bundesliga", "Ligue 1", "Liga MX"]
 CUPS = {"UEFA Champions League", "UEFA Europa League"}
+NATIONAL = {"UEFA Nations League", "CONCACAF Nations League"}
 REFIT_SECONDS = 6 * 3600
 
 # Backtest (docs/PLAN_FUTBOL.md, fases 1–4): 6 ligas, 2022–2026, semana a semana
@@ -75,7 +76,13 @@ def _fit_all() -> Dict:
         fd_names["_cups"] = eu_fd
     except Exception as e:
         logger.warning(f"Fútbol v2: sin modelo de copas ({type(e).__name__}: {e})")
-    return {"fits": fits, "joint": joint, "fd_names": fd_names, "at": time.time()}
+    national = None
+    try:
+        from app.services.soccer_national import fit_national, load_results
+        national = fit_national(load_results(), today)
+    except Exception as e:
+        logger.warning(f"Fútbol v2: sin modelo de selecciones ({type(e).__name__}: {e})")
+    return {"fits": fits, "joint": joint, "national": national, "fd_names": fd_names, "at": time.time()}
 
 
 def _state_now() -> Dict:
@@ -97,7 +104,21 @@ def predict_games_sync(games: List[Tuple[int, str, str, str, bool]]) -> Dict[int
     out = {}
     for gid, home, away, comp, neutral in games:
         try:
-            if comp in CUPS:
+            if comp in NATIONAL:
+                fit = st.get("national")
+                if fit is None:
+                    continue
+                from app.services.soccer_national import team_name
+                known = set(fit.teams)
+                h, a = team_name(home, known), team_name(away, known)
+                if h is None or a is None:
+                    logger.warning(f"Fútbol v2: selección sin historial: {home if h is None else away}")
+                h, a = h or home, a or away
+                m = fit.score_matrix(h, a, neutral)
+                ti = {t: k for k, t in enumerate(fit.teams)}
+                ratings = {side: {"attack": round(float(fit.attack[ti[t]]), 2), "defense": round(float(fit.defense[ti[t]]), 2)}
+                           for side, t in (("home", h), ("away", a)) if t in ti}
+            elif comp in CUPS:
                 if st.get("joint") is None:
                     continue
                 nm = match_names([home, away], st["fd_names"]["_cups"])
@@ -125,7 +146,7 @@ def predict_games_sync(games: List[Tuple[int, str, str, str, bool]]) -> Dict[int
             else:
                 continue
             mk = markets(m)
-            temp = TEMPERATURE_CUPS if comp in CUPS else TEMPERATURE
+            temp = TEMPERATURE_CUPS if comp in CUPS else 1.0 if comp in NATIONAL else TEMPERATURE
             p = _calibrate(np.array([mk["home"], mk["draw"], mk["away"]]), temp)
             i, j = np.unravel_index(int(np.argmax(m)), m.shape)
             exp_h, exp_a = mk["exp_home"], mk["exp_away"]
