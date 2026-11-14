@@ -34,7 +34,7 @@ TEMPERATURE_CUPS = 0.95     # copas: casi calibrado; en favoritos ≥80% exagera
 SHOTS_LEAGUES = {"Premier League", "La Liga", "Serie A", "Bundesliga", "Ligue 1"}
 LEAGUES = ["Premier League", "La Liga", "Serie A", "Bundesliga", "Ligue 1", "Liga MX"]
 CUPS = {"UEFA Champions League", "UEFA Europa League"}
-NATIONAL = {"UEFA Nations League", "CONCACAF Nations League"}
+NATIONAL = {"UEFA Nations League", "CONCACAF Nations League", "World Cup", "Euro Championship", "Copa America"}
 REFIT_SECONDS = 6 * 3600
 
 # Backtest (docs/PLAN_FUTBOL.md, fases 1–4): 6 ligas, 2022–2026, semana a semana

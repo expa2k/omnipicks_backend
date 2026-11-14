@@ -297,6 +297,7 @@ SOCCER_V2_COMPETITIONS = {
     "fra.1": "Ligue 1", "mex.1": "Liga MX", "uefa.champions": "UEFA Champions League",
     "uefa.europa": "UEFA Europa League",
     "uefa.nations": "UEFA Nations League", "concacaf.nations.league": "CONCACAF Nations League",
+    "fifa.world": "World Cup", "uefa.euro": "Euro Championship", "conmebol.america": "Copa America",
 }
 _SOCCER_STATUS = {"STATUS_SCHEDULED": "NS", "STATUS_FULL_TIME": "FT", "STATUS_FINAL": "FT",
                   "STATUS_FINAL_AET": "FT", "STATUS_FINAL_PEN": "FT", "STATUS_POSTPONED": "PST",
