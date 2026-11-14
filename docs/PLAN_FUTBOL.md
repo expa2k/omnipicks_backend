@@ -109,3 +109,30 @@ En 2022–26, el Brier del modelo es 0.592 contra 0.575 de Pinnacle; el log loss
 - El modelo actual de la app (sin topes, muestras de 1–3 partidos) no se puede ni comparar, porque daba marcadores como 1.07–15.38.
 - En la Liga MX el modelo está más lejos del mercado (0.030). Allí los torneos cortos y la liguilla hacen todo más ruidoso; es candidata a ajustes propios (por ejemplo, un descuento más rápido).
 - **Siguiente (fase 2):** ratings con tiros y tiros a puerta en las 5 ligas europeas, que suelen predecir mejor que los goles.
+
+## Fase 2: ratings con tiros a puerta (`soccer_dc.fit_rates`, `ml/scripts/soccer_shots_eval.py`)
+
+**Goles por tiros:** con 2010–2018 (antes de los años evaluados), **goles ≈ 0.289 × tiros a puerta**; los tiros desviados no aportan (coeficiente ≈ 0). La correlación con los goles del partido es 0.55.
+
+**Modelo:** los ratings de ataque y defensa se ajustan con una mezcla
+
+    y = w · goles + (1 − w) · 0.289 · tiros a puerta
+
+con cuasi-verosimilitud Poisson y gradiente analítico. El rho de los marcadores bajos sale del ajuste con goles. Los partidos sin datos de tiros usan solo goles.
+
+**Resultado** (5 ligas europeas; log loss del 1X2 y, entre paréntesis, el error de goles totales):
+
+| Periodo | w = 1 (fase 1) | **w = 0.7** | w = 0.5 | w = 0.3 | w = 0 (solo tiros) | Pinnacle |
+|---|---|---|---|---|---|---|
+| 2019–2021 | 0.9946 (1.31) | **0.9933 (1.30)** | 0.9943 | 0.9969 | 1.0040 | 0.9752 |
+| 2022–2026 | 0.9870 (1.31) | **0.9863 (1.31)** | 0.9874 | 0.9898 | 0.9962 | 0.9630 |
+
+**Qué dice:**
+- **70% goles y 30% tiros a puerta** es lo mejor en los dos periodos. La mejora es chica (−0.001), pero consistente. Mejora en Premier, Bundesliga, Ligue 1 y LaLiga; en la Serie A 2022–26 empeora un poco.
+- Solo tiros es peor que solo goles: los tiros a puerta solos no ven la calidad del remate.
+- Con xG real se esperaría más mejora. El xG de football-data se puede sumar desde 2026, cuando haya suficientes partidos.
+- **Decisión:** w = 0.7 en las 5 ligas europeas. La Liga MX sigue solo con goles, porque no tiene tiros.
+
+## Copas europeas: histórico (`app/services/soccer_cups.py`)
+
+**4,711 partidos** de Champions y Europa League de 2016 a 2026, bajados de ESPN día por día (martes a jueves) y guardados por temporada. Son la base de la fase 3: los cruces entre clubes de distintas ligas.

@@ -125,3 +125,52 @@ def markets(m: np.ndarray) -> Dict[str, float]:
         "over_2.5": float(m[tot > 2.5].sum()), "btts": float(m[1:, 1:].sum()),
         "exp_home": float((m.sum(axis=1) * g).sum()), "exp_away": float((m.sum(axis=0) * g).sum()),
     }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Fase 2: ratings con tiros (goles esperados aproximados)
+# ══════════════════════════════════════════════════════════════════════
+
+GOALS_PER_SOT = 0.289      # calibrado con 2010–2018 en las 5 grandes (los tiros desviados ≈ 0)
+
+
+def fit_rates(home: List[str], away: List[str], yh: np.ndarray, ya: np.ndarray, days_ago: np.ndarray,
+              params: DCParams = DCParams(), init: Optional[DCFit] = None, rho: float = 0.0) -> DCFit:
+    """Ataque, defensa, media y localía con objetivos continuos (cuasi-Poisson: y·log λ − λ), para
+    mezclar goles reales con goles esperados por tiros. Sin corrección de marcadores bajos: el `rho`
+    se toma del ajuste con goles."""
+    m = days_ago <= params.window_days
+    home = [h for h, k in zip(home, m) if k]
+    away = [a for a, k in zip(away, m) if k]
+    yh, ya, w = yh[m], ya[m], np.exp(-params.xi * days_ago[m])
+    teams = sorted(set(home) | set(away))
+    idx = {t: k for k, t in enumerate(teams)}
+    hi = np.array([idx[t] for t in home])
+    ai = np.array([idx[t] for t in away])
+    n = len(teams)
+
+    def nll_grad(p):
+        att, dfn, mu, hfa = p[:n], p[n:2 * n], p[2 * n], p[2 * n + 1]
+        lh = np.exp(mu + hfa + att[hi] - dfn[ai])
+        la = np.exp(mu + att[ai] - dfn[hi])
+        f = -np.sum(w * (yh * np.log(lh) - lh + ya * np.log(la) - la)) + params.ridge * (att @ att + dfn @ dfn)
+        rh, ra = w * (lh - yh), w * (la - ya)          # derivada respecto a log λ
+        g = np.zeros_like(p)
+        g[:n] = np.bincount(hi, rh, n) + np.bincount(ai, ra, n) + 2 * params.ridge * att
+        g[n:2 * n] = -np.bincount(ai, rh, n) - np.bincount(hi, ra, n) + 2 * params.ridge * dfn
+        g[2 * n] = rh.sum() + ra.sum()
+        g[2 * n + 1] = rh.sum()
+        return f, g
+
+    p0 = np.zeros(2 * n + 2)
+    p0[2 * n] = np.log(max(np.average(np.r_[yh, ya], weights=np.r_[w, w]), 0.3))
+    p0[2 * n + 1] = 0.25
+    if init is not None:
+        prev = {t: k for k, t in enumerate(init.teams)}
+        for t, k in idx.items():
+            if t in prev:
+                p0[k], p0[n + k] = init.attack[prev[t]], init.defense[prev[t]]
+        p0[2 * n], p0[2 * n + 1] = init.mu, init.home
+    res = minimize(nll_grad, p0, jac=True, method="L-BFGS-B", options={"maxiter": 500})
+    p = res.x
+    return DCFit(teams=teams, attack=p[:n], defense=p[n:2 * n], mu=float(p[2 * n]), home=float(p[2 * n + 1]), rho=rho)
